@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+from pathlib import Path
+import re
+import sys
+from docker_stack import envsubst
+def load_env(env_file=".env"):
+    """
+    Load environment variables from a file into the process environment.
+    """
+    if Path(env_file).is_file():
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    key, _, value = line.partition("=")
+                    os.environ[key.strip()] = value.strip()
+
+def check_env(example_file=".env.example"):
+    """
+    Check that all variables defined in `.env.example` are set in the environment.
+    Exit if any required variables are missing.
+    """
+    if not Path(example_file).is_file():
+        return
+
+    unset_keys = []
+    with open(example_file) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                key = line.split("=")[0].strip()
+                if not os.environ.get(key):
+                    unset_keys.append(key)
+
+    if unset_keys:
+        print("The following keys are not set in the environment:")
+        for key in unset_keys:
+            print(f"- {key}")
+        print("Exiting due to missing environment variables.")
+        sys.exit(2)
+
+def docker_stack_deploy(stack_name, compose_file, with_registry_auth=False):
+    """
+    Render the Docker Compose file with environment variables and deploy using Docker stack.
+    """
+    print(f"++ docker-stack-deploy {stack_name} {compose_file}")
+
+    # Render the Docker Compose file with substituted environment variables
+    with open(compose_file) as f:
+        template_content = f.read()
+    rendered_content = envsubst(template_content)
+
+    # Write the rendered file
+    rendered_filename = Path(compose_file).with_name(f"{Path(compose_file).stem}-rendered{Path(compose_file).suffix}")
+    with open(rendered_filename, "w") as f:
+        f.write(rendered_content)
+
+    # Deploy the stack
+    cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
+    if with_registry_auth:
+        cmd.insert(2, "--with-registry-auth")
+    subprocess.run(cmd, check=True)
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: deploy.py <stack_name> <compose_file> [--with-registry-auth]")
+        sys.exit(1)
+
+    stack_name = sys.argv[1]
+    compose_file = sys.argv[2]
+    with_registry_auth = "--with-registry-auth" in sys.argv
+
+    load_env()
+    check_env()
+    docker_stack_deploy(stack_name, compose_file, with_registry_auth)
+
+if __name__ == "__main__":
+    main()
