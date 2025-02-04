@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run All Pytest Tests",
+            "type": "python",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "-v",               // Verbose output
+                "--capture=no"      // Disable output capturing
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Run Pytest",
+            "type": "python",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "-v",               // Verbose output
+                "--capture=no",     // Disable output capturing (useful for debugging)
+                "${file}"           // Run tests in the current file
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true      // Debug only your code, not library code
+        }
+    ]
+}

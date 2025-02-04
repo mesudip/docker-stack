@@ -1,68 +1,131 @@
 #!/usr/bin/env python3
-
+from docker_stack import DockerConfig, DockerSecret
 import os
-import subprocess
 from pathlib import Path
-import re
 import sys
 from docker_stack import envsubst
-def load_env(env_file=".env"):
-    """
-    Load environment variables from a file into the process environment.
-    """
-    if Path(env_file).is_file():
-        with open(env_file) as f:
+import yaml
+
+from docker_stack.docker_objects import DockerObjectManager
+from docker_stack.helpers import Command  # For parsing YAML files
+
+class Docker:
+    def __init__(self):
+        self.stack = DockerStack(self)  # Initialize DockerStack as a property
+        self.config = DockerConfig()  # Initialize DockerConfig manager
+        self.secret = DockerSecret()  # Initialize DockerSecret manager
+
+    @staticmethod
+    def load_env(env_file=".env"):
+        """
+        Load environment variables from a file into the process environment.
+        """
+        if Path(env_file).is_file():
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        key, _, value = line.partition("=")
+                        os.environ[key.strip()] = value.strip()
+
+    @staticmethod
+    def check_env(example_file=".env.example"):
+        """
+        Check that all variables defined in `.env.example` are set in the environment.
+        Exit if any required variables are missing.
+        """
+        if not Path(example_file).is_file():
+            return
+
+        unset_keys = []
+        with open(example_file) as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    key, _, value = line.partition("=")
-                    os.environ[key.strip()] = value.strip()
+                    key = line.split("=")[0].strip()
+                    if not os.environ.get(key):
+                        unset_keys.append(key)
 
-def check_env(example_file=".env.example"):
-    """
-    Check that all variables defined in `.env.example` are set in the environment.
-    Exit if any required variables are missing.
-    """
-    if not Path(example_file).is_file():
-        return
+        if unset_keys:
+            print("The following keys are not set in the environment:")
+            for key in unset_keys:
+                print(f"- {key}")
+            print("Exiting due to missing environment variables.")
+            sys.exit(2)
 
-    unset_keys = []
-    with open(example_file) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                key = line.split("=")[0].strip()
-                if not os.environ.get(key):
-                    unset_keys.append(key)
+class DockerStack:
+    def __init__(self, docker):
+        self.docker = docker  # Reference to the parent Docker instance
+        self.commands=[]
 
-    if unset_keys:
-        print("The following keys are not set in the environment:")
-        for key in unset_keys:
-            print(f"- {key}")
-        print("Exiting due to missing environment variables.")
-        sys.exit(2)
+    def render_compose_file(self, compose_file):
+        """
+        Render the Docker Compose file with environment variables and create Docker configs/secrets.
+        """
+        with open(compose_file) as f:
+            template_content = f.read()
+        rendered_content = envsubst(template_content)
 
-def docker_stack_deploy(stack_name, compose_file, with_registry_auth=False):
-    """
-    Render the Docker Compose file with environment variables and deploy using Docker stack.
-    """
-    print(f"++ docker-stack-deploy {stack_name} {compose_file}")
+        # Parse the YAML content
+        compose_data = yaml.safe_load(rendered_content)
 
-    # Render the Docker Compose file with substituted environment variables
-    with open(compose_file) as f:
-        template_content = f.read()
-    rendered_content = envsubst(template_content)
+        # Process configs and secrets with x-content
+        if "configs" in compose_data:
+            compose_data["configs"] = self._process_x_content(compose_data["configs"], self.docker.config)
+        if "secrets" in compose_data:
+            compose_data["secrets"] = self._process_x_content(compose_data["secrets"], self.docker.secret)
 
-    # Write the rendered file
-    rendered_filename = Path(compose_file).with_name(f"{Path(compose_file).stem}-rendered{Path(compose_file).suffix}")
-    with open(rendered_filename, "w") as f:
-        f.write(rendered_content)
+        # Convert the modified data back to YAML
+        rendered_content = yaml.dump(compose_data)
 
-    # Deploy the stack
-    cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
-    if with_registry_auth:
-        cmd.insert(2, "--with-registry-auth")
-    subprocess.run(cmd, check=True)
+        # Write the rendered file
+        rendered_filename = Path(compose_file).with_name(
+            f"{Path(compose_file).stem}-rendered{Path(compose_file).suffix}"
+        )
+        with open(rendered_filename, "w") as f:
+            f.write(rendered_content)
+
+        return rendered_filename
+
+    def _process_x_content(self, objects, manager:DockerObjectManager):
+        """
+        Process configs or secrets with x-content keys.
+        Returns a tuple: (processed_objects, commands)
+        """
+        processed_objects = {}
+        for name, details in objects.items():
+            if isinstance(details, dict) and "x-content" in details:
+                # Create the Docker object (config or secret)
+                (object_name,command)=manager.update(name, details['x-content'])                
+                if not command.isNop():
+                    self.commands.append(command)
+                # Replace x-content with the name of the created object
+                processed_objects[name] = {"name": object_name,"external": True}
+            else:
+                processed_objects[name] = details
+        return processed_objects
+
+    def deploy(self, stack_name, compose_file, with_registry_auth=False):
+        """
+        Returns the command to deploy the Docker stack using the rendered Docker Compose file.
+        """
+        rendered_filename = self.render_compose_file(compose_file)
+
+        print(f"++ docker-stack-deploy {stack_name} {rendered_filename}")
+
+        cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
+        if with_registry_auth:
+            cmd.insert(3, "--with-registry-auth")
+        cmd.insert(3, "--detach=false")
+        self.commands.append(Command(cmd))
+        return cmd
+
+    def rm(self, stack_name):
+        """
+        Returns the command to remove a Docker stack.
+        """
+        print(f"++ docker stack rm {stack_name}")
+        return ["docker", "stack", "rm", stack_name]
 
 def main():
     if len(sys.argv) < 3:
@@ -73,9 +136,21 @@ def main():
     compose_file = sys.argv[2]
     with_registry_auth = "--with-registry-auth" in sys.argv
 
-    load_env()
-    check_env()
-    docker_stack_deploy(stack_name, compose_file, with_registry_auth)
+    # Initialize Docker and load environment
+    docker = Docker()
+    docker.load_env()
+    docker.check_env()
+
+    # Get the deploy command
+    docker.stack.deploy(stack_name, compose_file, with_registry_auth)
+    
+    print("Commands to Execute")
+    [print('   >',x) for x in docker.stack.commands]
+    [x.execute() for x in docker.stack.commands]
+
+    # Example of getting the remove command (uncomment to use)
+    # rm_command = docker.stack.rm(stack_name)
+    # print("Remove Command:", rm_command)
 
 if __name__ == "__main__":
     main()
