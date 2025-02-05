@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+from typing import List
 from docker_stack import DockerConfig, DockerSecret
 import os
 from pathlib import Path
 import sys
 from docker_stack import envsubst
 import yaml
+import json
 
 from docker_stack.docker_objects import DockerObjectManager
 from docker_stack.helpers import Command  # For parsing YAML files
@@ -54,9 +56,9 @@ class Docker:
             sys.exit(2)
 
 class DockerStack:
-    def __init__(self, docker):
-        self.docker = docker  # Reference to the parent Docker instance
-        self.commands=[]
+    def __init__(self, docker:Docker):
+        self.docker:Docker = docker  # Reference to the parent Docker instance
+        self.commands:List[Command] =[]
 
     def render_compose_file(self, compose_file):
         """
@@ -76,6 +78,7 @@ class DockerStack:
             compose_data["secrets"] = self._process_x_content(compose_data["secrets"], self.docker.secret)
 
         # Convert the modified data back to YAML
+        
         rendered_content = yaml.dump(compose_data)
 
         # Write the rendered file
@@ -84,8 +87,11 @@ class DockerStack:
         )
         with open(rendered_filename, "w") as f:
             f.write(rendered_content)
+        with open(rendered_filename.as_posix()+".json","w") as f:
+            f.write(json.dumps(compose_data,indent=2))
+        return (rendered_filename,rendered_content)
 
-        return rendered_filename
+
 
     def _process_x_content(self, objects, manager:DockerObjectManager):
         """
@@ -96,7 +102,7 @@ class DockerStack:
         for name, details in objects.items():
             if isinstance(details, dict) and "x-content" in details:
                 # Create the Docker object (config or secret)
-                (object_name,command)=manager.update(name, details['x-content'])                
+                (object_name,command)=manager.create(name, details['x-content'])                
                 if not command.isNop():
                     self.commands.append(command)
                 # Replace x-content with the name of the created object
@@ -109,14 +115,16 @@ class DockerStack:
         """
         Returns the command to deploy the Docker stack using the rendered Docker Compose file.
         """
-        rendered_filename = self.render_compose_file(compose_file)
-
-        print(f"++ docker-stack-deploy {stack_name} {rendered_filename}")
+        (rendered_filename,rendered_content) = self.render_compose_file(compose_file)
+        
+        (_,cmd)=self.docker.config.increment(stack_name,rendered_content,[f"mesudip.stack.name={stack_name}"])
+        if not  cmd.isNop():
+            self.commands.append(cmd)
 
         cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
         if with_registry_auth:
             cmd.insert(3, "--with-registry-auth")
-        cmd.insert(3, "--detach=false")
+        # cmd.insert(3, "--detach=false")
         self.commands.append(Command(cmd))
         return cmd
 
@@ -127,14 +135,14 @@ class DockerStack:
         print(f"++ docker stack rm {stack_name}")
         return ["docker", "stack", "rm", stack_name]
 
-def main():
-    if len(sys.argv) < 3:
+def main(argv:List[str]):
+    if len(argv) < 3:
         print("Usage: deploy.py <stack_name> <compose_file> [--with-registry-auth]")
         sys.exit(1)
 
-    stack_name = sys.argv[1]
-    compose_file = sys.argv[2]
-    with_registry_auth = "--with-registry-auth" in sys.argv
+    stack_name = argv[1]
+    compose_file = argv[2]
+    with_registry_auth = "--with-registry-auth" in argv
 
     # Initialize Docker and load environment
     docker = Docker()
@@ -145,7 +153,7 @@ def main():
     docker.stack.deploy(stack_name, compose_file, with_registry_auth)
     
     print("Commands to Execute")
-    [print('   >',x) for x in docker.stack.commands]
+    [print('   >',x) for x in docker.stack.commands] if docker.stack.commands else [print("-- empty --")]
     [x.execute() for x in docker.stack.commands]
 
     # Example of getting the remove command (uncomment to use)
@@ -153,4 +161,5 @@ def main():
     # print("Remove Command:", rm_command)
 
 if __name__ == "__main__":
-    main()
+    # main(sys.argv)
+    main(["docker-stack","mongodb","./docker-compose.yml"])

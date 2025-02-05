@@ -12,6 +12,7 @@ import os
 import re
 import sys
 
+
 def envsubst(template_str, env=os.environ):
     """Substitute environment variables in the template string, supporting default values."""
 
@@ -46,6 +47,7 @@ def envsubst(template_str, env=os.environ):
 
     return template_str
 
+
 def merge_files_from_directories(directories, file_extension=None):
     merged_content = []
 
@@ -56,11 +58,15 @@ def merge_files_from_directories(directories, file_extension=None):
                 if not file_extension or filename.endswith(file_extension):
                     filepath = os.path.join(path, filename)
                     with open(filepath, "r") as file:
-                        content = file.read().strip()  # Strip leading/trailing whitespace
+                        content = (
+                            file.read().strip()
+                        )  # Strip leading/trailing whitespace
                         if content:  # Add only non-empty content
                             # Add directory and filename as a comment at the start of the content
                             merged_content.append(f"# {path}/{filename}\n{content}")
-        elif os.path.isfile(path) and (not file_extension or path.endswith(file_extension)):
+        elif os.path.isfile(path) and (
+            not file_extension or path.endswith(file_extension)
+        ):
             # If the path is a file with the specified extension, read its content
             with open(path, "r") as file:
                 content = file.read().strip()  # Strip leading/trailing whitespace
@@ -81,6 +87,7 @@ def merge_files_from_directories(directories, file_extension=None):
 
     # Perform environment variable substitution on the final result
     return envsubst(result)
+
 
 def main():
     # Take directories or files from command-line arguments
@@ -112,6 +119,7 @@ def main():
 
     # Print the output to stdout
     print(result)
+
 
 if __name__ == "__main__":
     main()

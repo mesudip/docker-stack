@@ -18,10 +18,10 @@ import sys
 
 def envsubst(template_str, env=os.environ):
     """Substitute environment variables in the template string, supporting default values."""
-    
+
     # Regex for ${VARIABLE} with optional default
     pattern_with_default = re.compile(r"\$\{([^}:\s]+)(?::-(.*?))?\}")
-    
+
     # Regex for $VARIABLE without default
     pattern_without_default = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
 
@@ -44,7 +44,7 @@ def envsubst(template_str, env=os.environ):
 
     # Substitute variables with default values
     template_str = pattern_with_default.sub(replace_with_default, template_str)
-    
+
     # Substitute variables without default values
     template_str = pattern_without_default.sub(replace_without_default, template_str)
 
