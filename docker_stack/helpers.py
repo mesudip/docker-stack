@@ -85,6 +85,8 @@ class Command:
             return
         # Use the provided log value if available, otherwise use the one from the constructor
         use_log = log if log is not None else self.log
+        if not self.stdin:
+            subprocess.run(self.command)
         return run_cli_command(self.command, stdin=self.stdin, log=use_log, shell=False)
 
     def __str__(self) -> str:
