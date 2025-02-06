@@ -11,7 +11,6 @@ setup(
     url="https://github.com/mesuidp/docker-stack",  # Replace with your project URL
     packages=find_packages(),
     install_requires=[
-        "argparse",  # argparse is typically part of the Python Standard Library, but if needed explicitly add it
         "PyYAML"
     ],
     entry_points={
