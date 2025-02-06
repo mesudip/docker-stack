@@ -1,6 +1,7 @@
 from .envsubst import envsubst
 from .compose import read_compose_file
 from .docker_objects import DockerConfig, DockerSecret
+from .cli import main
 
 """
 Functions:
