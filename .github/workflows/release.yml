@@ -5,6 +5,13 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  deployments: write
+  packages: write
+  repository-projects: read
+  contents: read
+  id-token: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
