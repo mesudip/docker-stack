@@ -1,0 +1,176 @@
+networks:
+  default:
+  frontend-internal:
+    external: true
+configs:
+  mongo.conf:
+    x-content: |
+      net: 
+        bindIpAll: true ${NPNO_EXISTING_VARIABLE}
+      security:
+        keyFile: /run/secrets/security-key
+      replication:
+        replSetName: "sireto"
+  nginx-conf:
+    file: ./configs/nginx.conf
+    
+
+secrets:
+  security-key:
+    name: mongodb-security-key-v2
+    x-content: >
+      aH7GK1JOEGMVGK7IgcGQu3Rohk9jkgTJyO79bIhTpOO+e35F0zWgtrHsxW7I1vPV
+      Q7nbFpKFzGgriFAi/+Gjde76owjdOkAjwPd5r7Ds7jvevjGYPC29io7DSDH/9ovw
+      /eva4BNllEU1vrvyvhcq4RCaVWlDTBHkVZgJtJucZFC2c3IKfMnzimyO9O9ARXu5
+      3ofFSSC0Qjhji6uO8V/zwuWoj8S29WSH3FRfTCkk9u3+mjGlcqKzIukcEZkfB8xV
+      emYPrpUowt8bD51ygFKOF8gmpdYFMq4bvQx3opSxURNQA/y/4+epX9WFue3mjAZ4
+      YretirYW8zz71DDtYp+wQfjuxdoXwJQWM7QH0CwflwnnoKWXrRrNux8QtLx61wAI
+      O8+LzBjPf9bqEYt7Y7pwlksRLb9wHvcmety3HBxcuhtQwbHHmDA676/bUZsZxMsN
+      WkaBBRueT6H9TxH1VHHv3gutXg5sAPSbTlj5FjZGqVT91POF5GFg9Fw9epGO37bk
+      UyNb0L30lLDXJYVHOvydcyOLjtV+YMppVPvKEtW2lA7qACPRaaHSsyOJR3XUsZN5
+      7xaptLeL3qvG5Vjsa9Rt3T6+g+DonMRuYMidl20t1rpmevGYJKnduMkLS2zlUEah
+      WHlPQ41vUbQF4pAHFSdUpAhFZTjXDtPWJcCCCB34E2KS8l5wZLDuHXg8W3qsY4DA
+      ZYRqQGfNiEpx0UNKoR336JUPzQ+rPXIsD3MW8lrptNEWHfJzsHl+elj8Zu3cmTOA
+      bGBsKsJopKgDiUG4YMh08CgSAzZb0Mn5VkWD+ngi6ILg9lEBCcsZZ9JDWZnCX+9N
+      b8QNdLoyD1J2Qw3bvaVYrW0ahmYjsNHhUxY884136ikqS0fBdcfLFuyigKW64EEa
+      EnGsQRQ8A6Tom0L2CI82xkvEezxMSkKzcpIR+FFHz4gN0PMSeAgHlA==
+volumes:
+  mongodb1:
+  mongodb2:
+  arbiter1:
+services:      
+  nginx:
+    image: nginx:alpine
+    configs:
+      - nginx-conf
+
+  docker-stack:
+    image: registry.sireto.io/mesudip/docker-stack
+    build:
+      context:  .
+      args:
+        - name=value
+  mongodb1:
+    image: mongo:7.0
+    hostname: mongodb1.sireto.io
+
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=Fek88NfdF2TeQv2QdMp7RdCD
+    volumes:
+    - mongodb1:/data/db
+    entrypoint: 
+      - "sh"
+      - "-c"
+      - >
+        cp /run/secrets/security-key-orig /run/secrets/security-key &&
+        chmod 400 /run/secrets/security-key &&
+        chown 999:999 /run/secrets/security-key &&
+        exec docker-entrypoint.sh mongod -f /data/dbconf/mongod.conf
+    networks:
+      default:
+        aliases:
+          - mongodb1
+          - mongo1
+          - mongo1.sireto.io
+          - mongodb1.sireto.io
+    # ports:
+    # - target: 27017
+    #   published: 27017
+    #   mode: host
+    configs:
+      - source: mongo.conf
+        target: /data/dbconf/mongod.conf
+    secrets:
+      - source: security-key
+        target: /run/secrets/security-key-orig
+      
+    deploy:
+      restart_policy:
+        delay: 15s
+      placement:
+        constraints:
+          - node.labels.mongodb == true
+      resources:
+        limits:
+          memory: 2G
+  mongodb2:
+    image: mongo:7.0
+    hostname: mongodb2.sireto.io
+
+    # environment:
+    #   - MONGO_INITDB_ROOT_USERNAME=root
+    #   - MONGO_INITDB_ROOT_PASSWORD=Fek88NfdF2TeQv2QdMp7RdCD
+    entrypoint: 
+      - "sh"
+      - "-c"
+      - >
+        cp /run/secrets/security-key-orig /run/secrets/security-key &&
+        chmod 400 /run/secrets/security-key &&
+        chown 999:999 /run/secrets/security-key &&
+        exec docker-entrypoint.sh mongod -f /data/dbconf/mongod.conf
+    volumes:
+    - mongodb2:/data/db
+    configs:
+      - source: mongo.conf
+        target: /data/dbconf/mongod.conf
+    secrets:
+      - source: security-key
+        target: /run/secrets/security-key-orig
+
+    networks:
+      default:
+        aliases:
+          - mongodb2
+          - mongo2
+          - mongo2.sireto.io
+          - mongodb2.sireto.io
+    # ports:
+    # - target: 27017
+    #   published: 27017
+    #   mode: host
+    deploy:
+      restart_policy:
+        delay: 15s
+      placement:
+        constraints:
+          - node.labels.mongodb == true
+      resources:
+        limits:
+          memory: 2G
+  arbiter1:
+    image: mongo:7.0
+    hostname: arbiter1.sireto.io
+    volumes:
+    - arbiter1:/data/db
+    # environment:
+    #   - MONGO_INITDB_ROOT_USERNAME=root
+    #   - MONGO_INITDB_ROOT_PASSWORD=Fek88NfdF2TeQv2QdMp7RdCD
+    entrypoint: 
+      - "sh"
+      - "-c"
+      - >
+        cp /run/secrets/security-key-orig /run/secrets/security-key &&
+        chmod 400 /run/secrets/security-key && 
+        chown 999:999 /run/secrets/security-key &&
+        exec docker-entrypoint.sh mongod -f /data/dbconf/mongod.conf
+    configs:
+      - source: mongo.conf
+        target: /data/dbconf/mongod.conf
+    secrets:
+      - source: security-key
+        target: /run/secrets/security-key-orig
+    networks:
+      default:
+        aliases:
+          - arbiter1
+          - arbiter1.sireto.io
+    deploy:
+      restart_policy:
+        delay: 15s
+      placement:
+        constraints:
+          - node.labels.mongodb == true
+      resources:
+        limits:
+          memory: 500M

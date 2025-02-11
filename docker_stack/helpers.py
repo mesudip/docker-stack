@@ -56,7 +56,7 @@ class Command:
         return self == Command.nop
 
     def __init__(
-        self, command: List[str], stdin: Optional[str] = None, log: bool = True, id=None
+        self, command: List[str], stdin: Optional[str] = None, log: bool = True, id=None,give_console=False
     ):
         """
         Initialize a Command object.
@@ -70,6 +70,8 @@ class Command:
         self.stdin = stdin
         self.log = log
         self.id = id
+        self.give_console=give_console
+        
 
     def execute(self, log: Optional[bool] = None) -> str:
         """
@@ -85,8 +87,14 @@ class Command:
             return
         # Use the provided log value if available, otherwise use the one from the constructor
         use_log = log if log is not None else self.log
+        
         if not self.stdin:
-            subprocess.run(self.command)
+            if self.give_console:
+                print("Giving console")
+                process = subprocess.Popen(self.command, shell=True)
+                process.wait()
+            else:
+                subprocess.run(self.command)
         return run_cli_command(self.command, stdin=self.stdin, log=use_log, shell=False)
 
     def __str__(self) -> str:

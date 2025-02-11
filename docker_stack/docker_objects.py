@@ -45,10 +45,11 @@ class DockerObjectManager:
             return False
 
     def create(
-        self, object_name, object_content, labels: List[str] = []
+        self, object_name, object_content, labels: List[str] = [],stack=None
     ) -> Tuple[str, Command]:
         sha_hash = self.calculate_hash(object_name, object_content)
-
+        if stack :
+            labels=labels + ["com.docker.stack.namespace="+stack]
         # Check if any version of the object already exists by its label
         command = [
             "docker",
@@ -121,10 +122,11 @@ class DockerObjectManager:
         )
 
     def increment(
-        self, object_name, object_content, labels: List[str] = []
+        self, object_name, object_content, labels: List[str] = [],stack=None
     ) -> Tuple[str, Command]:
         sha_hash = self.calculate_hash(object_name, object_content)
-
+        if stack :
+            labels=labels + ["com.docker.stack.namespace="+stack]
         # Check if any version of the object already exists by its label
         command = [
             "docker",

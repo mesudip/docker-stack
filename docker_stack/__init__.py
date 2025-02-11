@@ -1,4 +1,5 @@
-from .envsubst import envsubst
+
+from .envsubst import envsubst, envsubst_load_file
 from .compose import read_compose_file
 from .docker_objects import DockerConfig, DockerSecret
 from .cli import main
