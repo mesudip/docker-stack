@@ -3,11 +3,13 @@ import http.client
 import select
 import subprocess
 from base64 import b64encode
+from typing import Dict, List
 
 from docker_stack.helpers import Command
+from docker_stack.url_parser import ConnectionDetails, parse_url
 
 class DockerRegistry:
-    def __init__(self, registry_url, userpass:str=None):
+    def __init__(self, _registries:List[str]):
         """
         Initializes the DockerRegistry class with the registry URL, and optional
         username and password for authentication.
@@ -16,52 +18,51 @@ class DockerRegistry:
         :param username: Optional username for authentication
         :param password: Optional password for authentication
         """
-        self.registry_url = registry_url
-        self.username = None
-        self.password = None
-        if userpass:
-            splitted=userpass.split(':')
-            
-            self.username=splitted[0]
-            self.password=splitted[1]
-       
-        # Parse registry host and port
-        self.host = self._get_host_from_url(registry_url)
-        self.port = 443 if self.registry_url.startswith("https") else 80
+        registries = [ parse_url(registry) for registry in _registries]
+        for registry in registries:
+            splitted=registry["host"].split(':')
+            if len(splitted)> 1:
+                if splitted[1] =='443':
+                    registry['host']=splitted[0]
+                    registry["scheme"] = "https"
+        self.registries:Dict[str,ConnectionDetails] = {x["host"]:x for x in registries}
+        self.authenticated=set()
+
     
-    def _get_host_from_url(self, url):
+    def _get_host_from_url(self, url:str):
         """Extracts the host from the URL."""
         # Remove protocol part (http:// or https://)
-        return url.split('://')[1].split('/')[0]
+        if url.startswith('http://') or url.startswith("https://"):
+            return url.split('://')[1].split('/')[0]
+        return url
     
-    def _send_request(self, method, endpoint, auth=None):
+    def _send_request(self, conn:ConnectionDetails ,method, endpoint):
         """Send a generic HTTP request to the Docker registry."""
-        connection = http.client.HTTPSConnection(self.host, self.port)
+        connection = http.client.HTTPSConnection(conn["host"]) if conn["scheme"]=='https' else http.client.HTTPConnection(conn["host"])
         
         # Add Authorization header if needed
         headers = {}
-        if auth:
-            headers['Authorization'] = f"Basic {b64encode(auth.encode()).decode()}"
+        if conn["username"]:
+            auth_string=conn['username']+':'+conn['password']
+            print("auth_string",auth_string)
+            headers['Authorization'] = f"Basic {b64encode(auth_string.encode()).decode()}"
         
         connection.request(method, endpoint, headers=headers)
         response = connection.getresponse()
         return response
     
-    def check_auth(self):
+    def check_auth(self,conn:ConnectionDetails):
         """
         Check if the authentication credentials (if provided) are valid for the Docker registry.
         
         :return: Boolean indicating whether authentication is successful
         """
         url = "/v2/"
-        if self.username and self.password:
-            auth = f"{self.username}:{self.password}"
-            response = self._send_request('GET', url, auth)
-        else:
-            response = self._send_request('GET', url)
+        response = self._send_request(conn,'GET', url)
+        if response.status == 200:
+            self.authenticated.add(conn["host"])
+            return True
 
-        # Check if the status code is 200
-        return response.status == 200
 
     def check_image(self, image_name):
         """
@@ -70,14 +71,15 @@ class DockerRegistry:
         :param image_name: Name of the image (e.g., 'ubuntu' or 'python')
         :return: Boolean indicating whether the image exists in the registry
         """
+        self.login_for_image(image_name)
+        hostname=extract_host_from_image_name(image_name)
         url = f"/v2/{image_name}/tags/list"
-        if self.username and self.password:
-            auth = f"{self.username}:{self.password}"
-            response = self._send_request('GET', url, auth)
-        else:
-            response = self._send_request('GET', url)
 
-        # Check if the status code is 200
+        if hostname in self.registries:
+            response = self._send_request(self.registries[hostname],'GET',url)
+        else:
+            registry=parse_url(hostname)
+            response =  self._send_request(registry,'GET',url)
         return response.status == 200
     
     def _run_docker_command(self, command):
@@ -133,6 +135,7 @@ class DockerRegistry:
         :param image_name: Name of the image to push (e.g., 'myrepo/myimage:tag')
         :return: Tuple of (stdout, stderr)
         """
+        self.login_for_image(image_name)
         return Command(['docker', 'push', image_name])
 
     def pull(self, image_name):
@@ -142,9 +145,49 @@ class DockerRegistry:
         :param image_name: Name of the image to pull (e.g., 'myrepo/myimage:tag')
         :return: Tuple of (stdout, stderr)
         """
+        self.login_for_image(image_name)
         command = ['docker', 'pull', image_name]
         return self._run_docker_command(command)
 
-    def login(self):
-        print("> " ,['docker','login','-u',self.username,'-p',self.password])
-        subprocess.run(['docker','login','-u',self.username,'-p',self.password,self.host])
+
+    def login_for_image(self,image):
+        hostname= extract_host_from_image_name(image)
+        if hostname  in self.authenticated:
+            return True
+        if hostname in self.registries and self.check_auth(self.registries[hostname]):
+            self.authenticated.add(self.registries[hostname])
+        else:
+            registry=self.registries.get(hostname)
+            if registry:
+                print("> " ," ".join(['docker','login','-u',registry["username"],'-p','[redacted]',registry["host"]]) )
+                subprocess.run(['docker','login','-u',registry['username'],'-p',registry['password'],registry["host"]])
+                self.authenticated.add(hostname)  
+        return hostname
+
+
+def extract_host_from_image_name(image_name: str) -> str:
+    """
+    Extracts the hostname (registry address) from a Docker image name.
+    
+    :param image_name: Docker image name (e.g., 'ubuntu', 'myregistry.com/myimage', or 'myregistry.com/myrepo/myimage:tag')
+    :return: Hostname (e.g., 'docker.io', 'myregistry.com')
+    """
+    # Remove protocol part (http:// or https://) if present
+    if image_name.startswith('http://'):
+        image_name = image_name[len('http://'):]
+    elif image_name.startswith('https://'):
+        image_name = image_name[len('https://'):]
+
+    # Check if the image name has a registry/hostname
+    if '/' in image_name:
+        parts = image_name.split('/', 1)
+        # If it looks like a full URL (e.g., myregistry.com/myimage:tag)
+        if '.' in parts[0] and not parts[0].startswith('http'):
+            splitted=parts[0].split(':')
+            if len(splitted)> 1:
+                if splitted[1] =='443':
+                    return splitted[0]
+            return parts[0]
+        # If it looks like a username/repository (e.g., 'username/myimage')
+        return 'docker.io'
+    return 'docker.io'

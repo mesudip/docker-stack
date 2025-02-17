@@ -12,11 +12,11 @@ from docker_stack.registry import DockerRegistry
 from .envsubst import envsubst, envsubst_load_file
 
 class Docker:
-    def __init__(self,resgistry_url='https://docker.io',userpass=''):
+    def __init__(self,registries:List[str]=[]):
         self.stack = DockerStack(self)
         self.config = DockerConfig()
         self.secret = DockerSecret()
-        self.registry = DockerRegistry(resgistry_url, userpass)
+        self.registry = DockerRegistry(registries)
 
     @staticmethod
     def load_env(env_file=".env"):
@@ -155,20 +155,21 @@ def main(args:List[str]=None):
     parser.add_argument("stack_name", help="Name of the stack", nargs="?")
     parser.add_argument("compose_file", help="Path to the compose file")
     parser.add_argument("--with-registry-auth", action="store_true", help="Use registry authentication")
-    parser.add_argument("-u", "--user", help="Registry credentials in format username:password", required=False)
+    parser.add_argument("-u", "--user", help="Registry credentials in format hostname:username:password",action='append', required=False,default=[])
+    parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
+
 
     args = parser.parse_args(args=(args if args else sys.argv[1:]))
-    docker = Docker(resgistry_url="https://registry.sireto.io",userpass='admin:69a017f5de7509e5e7ab0e89a5687dbda58f4fa70762bee17d2e454704bd7a4f')
+    docker = Docker(registries=args.user)
     docker.load_env()
     docker.check_env()
-    docker.registry.login()
 
     if args.command == "push":
         docker.stack.push(args.compose_file, args.user)
     else:
         docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth)
 
-    [x.execute() for x in docker.stack.commands]
+    # [x.execute() for x in docker.stack.commands]
 
 if __name__ == "__main__":
-    main()
+    main([""])
