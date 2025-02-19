@@ -32,7 +32,6 @@ def is_valid_hostname(hostname: str) -> bool:
     return all(allowed.match(label) for label in labels)
 def is_valid_hostport(str):
     results=str.split(':')
-    print("isValidhostport",results)
     def is_valid_integer(s):
         try:
             int(s)  # Try converting the string to an integer
@@ -135,7 +134,6 @@ def parse_url(url)-> ConnectionDetails:
         username = match.group("username")
         password = match.group("password")
         hostport = match.group("hostport")
-        print(match)
         if is_valid_hostport(hostport):
             return {
             "scheme": "https",

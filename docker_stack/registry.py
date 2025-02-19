@@ -7,7 +7,7 @@ from typing import Dict, List
 
 from docker_stack.helpers import Command
 from docker_stack.url_parser import ConnectionDetails, parse_url
-
+import os
 class DockerRegistry:
     def __init__(self, _registries:List[str]):
         """
@@ -25,10 +25,56 @@ class DockerRegistry:
                 if splitted[1] =='443':
                     registry['host']=splitted[0]
                     registry["scheme"] = "https"
-        self.registries:Dict[str,ConnectionDetails] = {x["host"]:x for x in registries}
+        
+        self.registries:Dict[str,ConnectionDetails] = {x["host"]:x for x in self.load_system_connections()} 
+        for reg in registries:
+            self.registries[reg["host"]]=reg
+            
         self.authenticated=set()
 
-    
+    def load_system_connections(self) -> List[ConnectionDetails]:
+        # Determine the path to the Docker config file
+        home_dir = os.getenv('HOME', '/root')
+        config_path = os.path.join(home_dir, '.docker', 'config.json')
+
+        # Initialize an empty list to store connection details
+        connections = []
+
+        try:
+            # Open and read the Docker config file
+            with open(config_path, 'r') as file:
+                config = json.load(file)
+
+                # Extract the 'auths' section
+                auths = config.get('auths', {})
+                for host, auth_info in auths.items():
+                    # Extract the auth token (username:password in base64)
+                    auth_token = auth_info.get('auth', '')
+                    if auth_token:
+                        # Decode the base64 token to get username:password
+                        import base64
+                        decoded_token = base64.b64decode(auth_token).decode('utf-8')
+                        username, password = decoded_token.split(':', 1)
+
+                        # Create a ConnectionDetails dictionary
+                        connection: ConnectionDetails = {
+                            'scheme': 'https',  # Docker registries typically use HTTPS
+                            'host': host,
+                            'username': username,
+                            'password': password
+                        }
+                        connections.append(connection)
+
+        except FileNotFoundError:
+            print("[Docker Config Load] Docker config file not found.")
+        except json.JSONDecodeError:
+            print("[Docker Config Load] Invalid JSON in Docker config file.")
+        except Exception as e:
+            print(f"[Docker Config Load] An error occurred: {e}")
+
+        return connections
+
+
     def _get_host_from_url(self, url:str):
         """Extracts the host from the URL."""
         # Remove protocol part (http:// or https://)
@@ -36,7 +82,7 @@ class DockerRegistry:
             return url.split('://')[1].split('/')[0]
         return url
     
-    def _send_request(self, conn:ConnectionDetails ,method, endpoint):
+    def _send_request(self, conn:ConnectionDetails ,method, endpoint)->http.client.HTTPResponse:
         """Send a generic HTTP request to the Docker registry."""
         connection = http.client.HTTPSConnection(conn["host"]) if conn["scheme"]=='https' else http.client.HTTPConnection(conn["host"])
         
@@ -44,7 +90,6 @@ class DockerRegistry:
         headers = {}
         if conn["username"]:
             auth_string=conn['username']+':'+conn['password']
-            print("auth_string",auth_string)
             headers['Authorization'] = f"Basic {b64encode(auth_string.encode()).decode()}"
         
         connection.request(method, endpoint, headers=headers)
@@ -80,6 +125,7 @@ class DockerRegistry:
         else:
             registry=parse_url(hostname)
             response =  self._send_request(registry,'GET',url)
+        print("response",response.read())
         return response.status == 200
     
     def _run_docker_command(self, command):
@@ -148,14 +194,14 @@ class DockerRegistry:
         self.login_for_image(image_name)
         command = ['docker', 'pull', image_name]
         return self._run_docker_command(command)
-
+            
 
     def login_for_image(self,image):
         hostname= extract_host_from_image_name(image)
         if hostname  in self.authenticated:
             return True
         if hostname in self.registries and self.check_auth(self.registries[hostname]):
-            self.authenticated.add(self.registries[hostname])
+            self.authenticated.add(hostname)
         else:
             registry=self.registries.get(hostname)
             if registry:

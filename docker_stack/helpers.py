@@ -9,6 +9,7 @@ def run_cli_command(
     log: bool = True,
     shell: bool = False,
     interactive: bool = False,
+    cwd=None
 ) -> str:
     """
     Run a CLI command and return its output.
@@ -25,11 +26,11 @@ def run_cli_command(
         The stdout of the command as a string, or None if interactive mode is enabled.
     """
     if log:
-        print("> " + " ".join(command))
+        print("> " + " ".join(command),flush=True)
 
     try:
         if interactive:
-            result = subprocess.run(command, shell=shell)
+            result = subprocess.run(command, shell=shell,cwd=cwd)
             return None
         else:
             result = subprocess.run(
@@ -39,6 +40,7 @@ def run_cli_command(
                 capture_output=True,
                 check=raise_error,
                 shell=shell,
+                cwd=cwd
             )
             return result.stdout.strip()
     except subprocess.CalledProcessError as e:
@@ -57,6 +59,7 @@ class Command:
 
     def __init__(
         self, command: List[str], stdin: Optional[str] = None, log: bool = True, id=None,give_console=False
+        ,cwd:str=None
     ):
         """
         Initialize a Command object.
@@ -71,6 +74,7 @@ class Command:
         self.log = log
         self.id = id
         self.give_console=give_console
+        self.cwd=cwd
         
 
     def execute(self, log: Optional[bool] = None) -> str:
@@ -91,11 +95,11 @@ class Command:
         if not self.stdin:
             if self.give_console:
                 print("Giving console")
-                process = subprocess.Popen(self.command, shell=True)
+                process = subprocess.Popen(self.command, shell=True,cwd=self.cwd)
                 process.wait()
             else:
                 subprocess.run(self.command)
-        return run_cli_command(self.command, stdin=self.stdin, log=use_log, shell=False)
+        return run_cli_command(self.command, stdin=self.stdin, log=use_log, shell=False,cwd=self.cwd)
 
     def __str__(self) -> str:
         """

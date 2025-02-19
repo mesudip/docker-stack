@@ -53,25 +53,34 @@ class DockerStack:
     def __init__(self, docker: Docker):
         self.docker = docker
         self.commands: List[Command] = []
+    
+    def read_compose_file(self,compose_file)->dict:
+        with open(compose_file) as f:
+           return self.decode_yaml(f.read())
+    
+    def rendered_compose_file(self,compose_file,stack=None)->str:
+        with open(compose_file) as f:
+            template_content = f.read()
+        # Parse the YAML content
+        compose_data = self.decode_yaml(template_content)
+        if stack:
+            base_dir = os.path.dirname(os.path.abspath(compose_file))
+            if "configs" in compose_data:
+                compose_data["configs"] = self._process_x_content(compose_data["configs"], self.docker.config,base_dir=base_dir,stack=stack)
+            if "secrets" in compose_data:
+                compose_data["secrets"] = self._process_x_content(compose_data["secrets"], self.docker.secret,base_dir=base_dir,stack=stack)
+        return envsubst(yaml.dump(compose_data))
+    
+    def decode_yaml(self,data:str)->dict:
+        return yaml.safe_load(data)
         
     def render_compose_file(self, compose_file,stack=None):
         """
         Render the Docker Compose file with environment variables and create Docker configs/secrets.
         """
-        with open(compose_file) as f:
-            template_content = f.read()
-        base_dir = os.path.dirname(os.path.abspath(compose_file))
-        # Parse the YAML content
-        compose_data = yaml.safe_load(template_content)
-
-        # Process configs and secrets with x-content
-        if "configs" in compose_data:
-            compose_data["configs"] = self._process_x_content(compose_data["configs"], self.docker.config,base_dir=base_dir,stack=stack)
-        if "secrets" in compose_data:
-            compose_data["secrets"] = self._process_x_content(compose_data["secrets"], self.docker.secret,base_dir=base_dir,stack=stack)
-
+        
         # Convert the modified data back to YAML
-        rendered_content = envsubst(yaml.dump(compose_data))
+        rendered_content = self.rendered_compose_file(compose_file,stack)
 
         # Write the rendered file
         rendered_filename = Path(compose_file).with_name(
@@ -80,7 +89,7 @@ class DockerStack:
         with open(rendered_filename, "w") as f:
             f.write(rendered_content)
         with open(rendered_filename.as_posix()+".json","w") as f:
-            f.write(json.dumps(compose_data,indent=2))
+            f.write(json.dumps(rendered_content,indent=2))
         return (rendered_filename,rendered_content)
 
 
@@ -123,27 +132,54 @@ class DockerStack:
             cmd.insert(3, "--with-registry-auth")
         self.commands.append(Command(cmd,give_console=True))
 
-    def push(self, compose_file, credentials):
-        with open(compose_file) as f:
-            compose_data = yaml.safe_load(f)
+    def push(self, compose_file):
+        compose_data = self.read_compose_file(compose_file)
         for service_name, service_data in compose_data.get("services", {}).items():
             if "build" in service_data:
-                build_path = service_data["build"]
-                print(f"++ docker build -t {service_data['image']} {build_path}")
-                build_command = ["docker", "build", "-t", service_data['image'], build_path.get('context', '.')]
-                self.commands.append(Command(build_command))
-                push_result = self.check_and_push_pull_image(service_data['image'], 'push')
+                image= envsubst(service_data['image'])
+                push_result = self.check_and_push_pull_image(image, 'push')
                 if push_result:
                     self.commands.append(push_result)
                 else:
-                    print("No need to push: Already exists")
+                    # print("No need to push: Already exists")
+                    pass
 
+    def build_and_push(self, compose_file: str, push: bool = False) -> None:
+        """
+        Build Docker images from a Compose file and optionally push them.
+
+        Args:
+            compose_file (str): Path to the Docker Compose file.
+            push (bool): Whether to push the built images. Defaults to False.
+        """
+        compose_data = self.read_compose_file(compose_file)
+        base_dir = os.path.dirname(os.path.abspath(compose_file))
+
+        for service_name, service_data in compose_data.get("services", {}).items():
+            if "build" in service_data:
+                build_config = service_data["build"]
+                image = envsubst(service_data['image'])
+
+                build_command = ["docker", "build", "-t", image]
+              
+                              
+                for  value in build_config.get('args', []):
+                    build_command.extend(["--build-arg", envsubst(value)])
+
+                build_command.append(os.path.join(base_dir, build_config.get('context', '.')))
+                self.commands.append(Command(build_command))
+
+                if push:
+                    push_result = self.check_and_push_pull_image(image, 'push')
+                    if push_result:
+                        self.commands.append(push_result)
+                    else:
+                        # print("No need to push: Already exists")
+                        pass
     def check_and_push_pull_image(self, image_name: str, action: str):
         if self.docker.registry.check_image(image_name):
-            print(f"Image {image_name} already in the registry.")
             return None
         if action == 'push':
-            print(f"Pushing image {image_name} to the registry...")
             cmd = self.docker.registry.push(image_name)
             if cmd:
                 self.commands.append(cmd)
@@ -151,25 +187,53 @@ class DockerStack:
 
 def main(args:List[str]=None):
     parser = argparse.ArgumentParser(description="Deploy and manage Docker stacks.")
-    parser.add_argument("command", choices=["deploy", "push"], help="Command to execute")
-    parser.add_argument("stack_name", help="Name of the stack", nargs="?")
-    parser.add_argument("compose_file", help="Path to the compose file")
-    parser.add_argument("--with-registry-auth", action="store_true", help="Use registry authentication")
-    parser.add_argument("-u", "--user", help="Registry credentials in format hostname:username:password",action='append', required=False,default=[])
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Build subcommand
+    build_parser = subparsers.add_parser("build", help="Build images using docker-compose")
+    build_parser.add_argument("compose_file", help="Path to the compose file")
+    build_parser.add_argument("--push", action="store_true", help="Use registry authentication")
+
+    # Push subcommand
+    push_parser = subparsers.add_parser("push", help="Push images to registry")
+    push_parser.add_argument("compose_file", help="Path to the compose file")
+    
+    # Deploy subcommand
+    deploy_parser = subparsers.add_parser("deploy", help="Deploy stack using docker stack deploy")
+    deploy_parser.add_argument("stack_name", help="Name of the stack")
+    deploy_parser.add_argument("compose_file", help="Path to the compose file")
+    deploy_parser.add_argument("--with-registry-auth", action="store_true", help="Use registry authentication")
+    
+    # Remove subcommand
+    rm_parser = subparsers.add_parser("rm", help="Remove a deployed stack")
+    rm_parser.add_argument("stack_name", help="Name of the stack")
+    
+    parser.add_argument("-u", "--user", help="Registry credentials in format hostname:username:password", action="append", required=False, default=[])
     parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
-
-
-    args = parser.parse_args(args=(args if args else sys.argv[1:]))
+    parser.add_argument("-ro",'-r',"--ro","--r", "--dry-run", action="store_true", help="Print commands, don't execute them", required=False)
+    
+    args = parser.parse_args(args if args else sys.argv[1:])
+    
     docker = Docker(registries=args.user)
     docker.load_env()
     docker.check_env()
-
-    if args.command == "push":
-        docker.stack.push(args.compose_file, args.user)
-    else:
+    
+    if args.command == "build":
+        docker.stack.build_and_push(args.compose_file,push=args.push)
+    elif args.command == "push":
+        docker.stack.push(args.compose_file)
+    elif args.command == "deploy":
         docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth)
+    elif args.command == "rm":
+        docker.stack.rm(args.stack_name)
+    
 
-    # [x.execute() for x in docker.stack.commands]
+    if args.ro:
+        print("Following commands were not executed:")
+        [print(" >> "+str(x)) for x in docker.stack.commands if x]
+    else:
+        [ x.execute() for x in docker.stack.commands]
+
 
 if __name__ == "__main__":
     main([""])
