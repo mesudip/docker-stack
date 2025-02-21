@@ -216,7 +216,6 @@ def main(args:List[str]=None):
     
     docker = Docker(registries=args.user)
     docker.load_env()
-    docker.check_env()
     
     if args.command == "build":
         docker.stack.build_and_push(args.compose_file,push=args.push)
