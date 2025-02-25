@@ -91,15 +91,19 @@ class Command:
             return
         # Use the provided log value if available, otherwise use the one from the constructor
         use_log = log if log is not None else self.log
-        
+        if use_log:
+            print("> " + " ".join(self.command),flush=True)
+
         if not self.stdin:
-            if self.give_console:
-                print("Giving console")
-                process = subprocess.Popen(self.command, shell=True,cwd=self.cwd)
-                process.wait()
-            else:
-                subprocess.run(self.command)
-        return run_cli_command(self.command, stdin=self.stdin, log=use_log, shell=False,cwd=self.cwd)
+            # if self.give_console:
+            #     print("Giving console")
+            #     process = subprocess.Popen(self.command, shell=True,cwd=self.cwd)
+            #     process.wait()
+            #     return process
+            # else:
+            return subprocess.run(self.command)
+        else:
+            return run_cli_command(self.command, stdin=self.stdin, log=False, shell=False,cwd=self.cwd)
 
     def __str__(self) -> str:
         """

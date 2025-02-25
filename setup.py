@@ -2,12 +2,12 @@ from setuptools import setup, find_packages
 
 setup(
     name="docker-stack",
-    version="0.2.1",
+    version="0.2.2",
     description="CLI for deploying and managing Docker stacks.",
     long_description=open("README.md").read(),  # You can include a README file to describe your package
     long_description_content_type="text/markdown",
     author="Sudip Bhattarai",
-    author_email="sudip.dev.np@gmail.com",
+    author_email="sudip@bhattarai.me",
     url="https://github.com/mesuidp/docker-stack",  # Replace with your project URL
     packages=find_packages(),
     install_requires=[

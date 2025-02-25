@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import List
@@ -121,10 +124,150 @@ class DockerStack:
             else:
                 processed_objects[name] = details
         return processed_objects
+    
+    def ls(self):
+        cmd = ["docker", "config", "ls", "--format", "{{.ID}}\t{{.Name}}\t{{.Labels}}"]
+        output = subprocess.check_output(cmd, text=True).strip().split("\n")
+        stack_versions = {}
+        
+        for line in output:
+            parts = line.split("\t")
+            if len(parts) == 3 and "mesudip.stack.name" in parts[2]:
+                labels = {k: v for k, v in (label.split("=") for label in parts[2].split(",") if "=" in label)}
+                stack_name = labels.get("mesudip.stack.name")
+                version = labels.get("mesudip.object.version", "unknown")
+                
+                if stack_name:
+                    if stack_name not in stack_versions:
+                        stack_versions[stack_name] = []
+                    stack_versions[stack_name].append(version)
 
-    def deploy(self, stack_name, compose_file, with_registry_auth=False):
+        # Calculate max stack name width
+        max_stack_name_length = max(len(stack) for stack in stack_versions) if stack_versions else 10
+        header_stack = "Stack Name".ljust(max_stack_name_length)
+        
+        print(f"{header_stack} | Versions")
+        print("-" * (max_stack_name_length + 12))
+        
+        for stack, versions in sorted(stack_versions.items()):
+            versions_str = ", ".join(sorted(versions, key=int))
+            print(f"{stack.ljust(max_stack_name_length)} | {versions_str}")
+
+        return stack_versions
+
+    def cat(self, name:str, version:str):
+        if version.startswith('v') or version.startswith('V'):
+            version = version[1:]
+        if version == '1':
+            name = f"{name}"
+        else:
+            name = f"{name}_v{version}"
+
+        cmd = ["docker", "config", "inspect", name]
+        output = subprocess.check_output(cmd, text=True).strip()
+        
+        # Parse the JSON output
+        configs = json.loads(output)
+        if not configs:
+            print(f"No config found for {name}")
+            return None
+
+        # Extract and decode the base64-encoded Spec.Data
+        encoded_data = configs[0].get("Spec", {}).get("Data", "")
+        if not encoded_data:
+            print(f"No data found in config {name}")
+            return None
+
+        decoded_data = base64.b64decode(encoded_data).decode("utf-8")        
+        return decoded_data
+
+    def versions(self, stack_name):
+        cmd = ["docker", "config", "ls", "--format", "{{.Name}}\t{{.Labels}}"]
+        output = subprocess.check_output(cmd, text=True).strip().split("\n")
+        versions_list = []
+
+        for line in output:
+            parts = line.split("\t")
+            if len(parts) == 2 and "mesudip.stack.name" in parts[1]:
+                labels = {k: v for k, v in (label.split("=") for label in parts[1].split(",") if "=" in label)}
+                stack = labels.get("mesudip.stack.name")
+                version = labels.get("mesudip.object.version", "unknown")
+                tag = labels.get("mesudip.stack.tag", "")
+
+                if stack == stack_name:
+                    versions_list.append((version, tag))
+
+        # Add headers to list for proper spacing calculation
+        versions_list.insert(0, ("Version", "Tag"))
+
+        # Determine max column widths
+        max_version_length = max(len(v[0]) for v in versions_list)
+        max_tag_length = max(len(v[1]) for v in versions_list)
+
+        # Print header
+        print(f"{'Version'.ljust(max_version_length)} | {'Tag'.ljust(max_tag_length)}")
+        print("-" * (max_version_length + max_tag_length + 3))
+
+        # Print sorted versions (excluding header)
+        for version, tag in sorted(versions_list[1:], key=lambda x: int(x[0]) if x[0].isdigit() else x[0]):
+            print(f"{version.ljust(max_version_length)} | {tag.ljust(max_tag_length)}")
+
+        return versions_list[1:]
+
+    def checkout(self, stack_name, identifier, with_registry_auth=False):
+        """
+        Deploys a stack by version or tag.
+        
+        :param stack_name: Name of the stack.
+        :param identifier: Version (e.g., 'v1.2', 'V3') or tag (e.g., 'stable', 'latest').
+        :param with_registry_auth: Whether to use registry authentication.
+        """
+
+        # Regex to check if the identifier is a version (optional "v" or "V" at the start, followed by digits)
+        version_pattern = re.compile(r"^[vV]?(\d+(\.\d+)*)$")
+
+        match = version_pattern.match(identifier)
+        if match:
+            version = match.group(1)  # Extract the numeric version part
+            tag = None
+        else:
+            tag = identifier
+            versions_list = self.versions(stack_name)
+            matching_versions = [v for v, t in versions_list if t == tag]
+            if not matching_versions:
+                raise ValueError(f"No version found for tag '{tag}' in stack '{stack_name}'")
+            version = matching_versions[0]  # Use the first matching version
+
+        compose_content = self.cat(stack_name, version)
+        
+        temp_file = f"/tmp/{stack_name}_v{version}.yml"
+        with open(temp_file, "w") as f:
+            f.write(compose_content)
+
+        print(f"Deploying stack {stack_name} with version {version} (tag: {tag})...")
+        self._deploy(stack_name, temp_file, compose_content, with_registry_auth=with_registry_auth, tag=tag)
+
+        
+    def _deploy(self, stack_name, rendered_filename,rendered_content, with_registry_auth=False,tag=None):
+        labels = [f"mesudip.stack.name={stack_name}"]
+        if tag:
+            labels.append(f"mesudip.stack.tag={tag}")
+
+        _, cmd = self.docker.config.increment(stack_name, rendered_content,labels=labels ,stack=stack_name)
+        if not cmd.isNop():
+            self.commands.append(cmd)
+        cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
+        if with_registry_auth:
+            cmd.insert(3, "--with-registry-auth")
+        self.commands.append(Command(cmd,give_console=True))
+
+    def deploy(self, stack_name, compose_file, with_registry_auth=False,tag=None):
         rendered_filename, rendered_content = self.render_compose_file(compose_file,stack=stack_name)
-        _, cmd = self.docker.config.increment(stack_name, rendered_content, [f"mesudip.stack.name={stack_name}"],stack=stack_name)
+        labels = [f"mesudip.stack.name={stack_name}"]
+        if tag:
+            labels.append(f"mesudip.stack.tag={tag}")
+
+        _, cmd = self.docker.config.increment(stack_name, rendered_content,labels=labels ,stack=stack_name)
         if not cmd.isNop():
             self.commands.append(cmd)
         cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
@@ -203,10 +346,30 @@ def main(args:List[str]=None):
     deploy_parser.add_argument("stack_name", help="Name of the stack")
     deploy_parser.add_argument("compose_file", help="Path to the compose file")
     deploy_parser.add_argument("--with-registry-auth", action="store_true", help="Use registry authentication")
-    
+    deploy_parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
+
     # Remove subcommand
     rm_parser = subparsers.add_parser("rm", help="Remove a deployed stack")
     rm_parser.add_argument("stack_name", help="Name of the stack")
+    
+    # Ls command
+    subparsers.add_parser("ls",help="List docker-stacks")
+    
+    cat_parser = subparsers.add_parser("cat",help="Print the docker compose of specific version")
+    cat_parser.add_argument("stack_name", help="Name of the stack")
+    cat_parser.add_argument("version", help="Stack version to cat")
+    
+    checkout_parser = subparsers.add_parser("checkout",help="Deploy specific version of the stack")
+    checkout_parser.add_argument("stack_name", help="Name of the stack")
+    checkout_parser.add_argument("version", help="Stack version to cat")
+
+    # version_parser = subparsers.add_parser("version",help="Deploy specific version of the stack")
+    # version_parser.add_argument("stack_name", help="Name of the stack")
+    # version_parser.add_argument("version","versions", help="Stack version to cat")
+        
+    version_parser = subparsers.add_parser("version",aliases=["versions"], help="Deploy specific version of the stack")
+    version_parser.add_argument("stack_name", help="Name of the stack")
+
     
     parser.add_argument("-u", "--user", help="Registry credentials in format hostname:username:password", action="append", required=False, default=[])
     parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
@@ -222,11 +385,18 @@ def main(args:List[str]=None):
     elif args.command == "push":
         docker.stack.push(args.compose_file)
     elif args.command == "deploy":
-        docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth)
+        docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth,tag=args.tag)
+    elif args.command == "ls":
+        docker.stack.ls()
+
     elif args.command == "rm":
         docker.stack.rm(args.stack_name)
-    
-
+    elif args.command == 'cat':
+        print(docker.stack.cat(args.stack_name,args.version))
+    elif args.command == 'checkout':
+        docker.stack.checkout(args.stack_name,args.version)
+    elif args.command == 'versions' or args.command == "version":
+        docker.stack.versions(args.stack_name)
     if args.ro:
         print("Following commands were not executed:")
         [print(" >> "+str(x)) for x in docker.stack.commands if x]
