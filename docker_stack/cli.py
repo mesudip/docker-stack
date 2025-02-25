@@ -306,8 +306,14 @@ class DockerStack:
                 build_command = ["docker", "build", "-t", image]
               
                               
-                for  value in build_config.get('args', []):
-                    build_command.extend(["--build-arg", envsubst(value)])
+                args = build_config.get('args', [])
+
+                if isinstance(args, dict):
+                    for key, val in args.items():
+                        build_command.extend(["--build-arg", f"{envsubst(key)}={envsubst(val)}"])
+                elif isinstance(args, list):
+                    for value in args:
+                        build_command.extend(["--build-arg", envsubst(value)])
 
                 build_command.append(os.path.join(base_dir, build_config.get('context', '.')))
                 self.commands.append(Command(build_command))
