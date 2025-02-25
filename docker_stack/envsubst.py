@@ -25,6 +25,7 @@ def envsubst(template_str, env=os.environ):
     # Regex for $VARIABLE without default
     pattern_without_default = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
 
+    template_str = template_str.replace("$$", "__ESCAPED_DOLLAR__")
     def print_error_line(template_str, match_span):
         """Helper function to print the error context."""
         lines = template_str.splitlines()
@@ -76,6 +77,8 @@ def envsubst(template_str, env=os.environ):
 
     # Substitute variables without default values
     template_str = pattern_without_default.sub(replace_without_default, template_str)
+    
+    template_str = template_str.replace("__ESCAPED_DOLLAR__", "$")
 
     return template_str
 
@@ -103,3 +106,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
