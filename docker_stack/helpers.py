@@ -1,4 +1,5 @@
 import subprocess
+import sys
 from typing import List, Optional
 
 
@@ -101,7 +102,9 @@ class Command:
             #     process.wait()
             #     return process
             # else:
-            return subprocess.run(self.command)
+            result= subprocess.run(self.command)
+            if result.returncode!= 0:
+                sys.exit(result.returncode)
         else:
             return run_cli_command(self.command, stdin=self.stdin, log=False, shell=False,cwd=self.cwd)
 
