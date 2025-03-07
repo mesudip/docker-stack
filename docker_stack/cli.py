@@ -61,11 +61,16 @@ class DockerStack:
         with open(compose_file) as f:
            return self.decode_yaml(f.read())
     
-    def rendered_compose_file(self,compose_file,stack=None)->str:
+    def rendered_compose_file(self,compose_file,stack=None,include_build=True)->str:
         with open(compose_file) as f:
             template_content = f.read()
         # Parse the YAML content
         compose_data = self.decode_yaml(template_content)
+        if not include_build:
+            services: dict=compose_data.get('services',{})
+            for (k,v) in services.items():
+                if 'build' in v:
+                    del v['build']
         if stack:
             base_dir = os.path.dirname(os.path.abspath(compose_file))
             if "configs" in compose_data:
@@ -77,13 +82,13 @@ class DockerStack:
     def decode_yaml(self,data:str)->dict:
         return yaml.safe_load(data)
         
-    def render_compose_file(self, compose_file,stack=None):
+    def render_compose_file(self, compose_file,stack=None,include_build=True):
         """
         Render the Docker Compose file with environment variables and create Docker configs/secrets.
         """
         
         # Convert the modified data back to YAML
-        rendered_content = self.rendered_compose_file(compose_file,stack)
+        rendered_content = self.rendered_compose_file(compose_file,stack,include_build=include_build)
 
         # Write the rendered file
         rendered_filename = Path(compose_file).with_name(
@@ -262,7 +267,7 @@ class DockerStack:
         self.commands.append(Command(cmd,give_console=True))
 
     def deploy(self, stack_name, compose_file, with_registry_auth=False,tag=None):
-        rendered_filename, rendered_content = self.render_compose_file(compose_file,stack=stack_name)
+        rendered_filename, rendered_content = self.render_compose_file(compose_file,stack=stack_name,include_build=False)
         labels = [f"mesudip.stack.name={stack_name}"]
         if tag:
             labels.append(f"mesudip.stack.tag={tag}")
