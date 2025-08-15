@@ -3,3 +3,6 @@ testpaths = [
     "tests", 
 ]
 pythonpath = ["docker_stack", "."]
+
+[tool.black]
+line-length = 140

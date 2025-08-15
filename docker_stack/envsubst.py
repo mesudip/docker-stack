@@ -14,9 +14,17 @@ DESCRIPTION
 import os
 import re
 import sys
+from typing import Dict, List, Literal
 
 
-def envsubst(template_str, env=os.environ):
+class SubstitutionError(Exception):
+    """Custom exception to collect multiple substitution errors."""
+    def __init__(self, messages: List[str]):
+        self.messages = messages
+        super().__init__("\n".join(messages))
+
+
+def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, on_error: Literal['exit','throw'] = 'exit'):
     """Substitute environment variables in the template string, supporting default values."""
 
     # Regex for ${VARIABLE} with optional default
@@ -26,9 +34,13 @@ def envsubst(template_str, env=os.environ):
     pattern_without_default = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
 
     template_str = template_str.replace("$$", "__ESCAPED_DOLLAR__")
-    def print_error_line(template_str, match_span):
-        """Helper function to print the error context."""
-        lines = template_str.splitlines()
+    
+    error_messages = [] # To store unique error messages
+    seen_error_lines = set() # To store unique error line contexts
+
+    def print_error_line(current_template_str, match_span):
+        """Helper function to collect unique error context lines."""
+        lines = current_template_str.splitlines()
         
         # Determine the start position and line
         start_pos = match_span[0]
@@ -50,7 +62,10 @@ def envsubst(template_str, env=os.environ):
         end = min(end_line + 1, len(lines) - 1)
 
         for i in range(start, end + 1):
-            print(f"{i + 1}: {lines[i]}",file=sys.stderr)
+            line_content = f"{i + 1}: {lines[i]}"
+            if line_content not in seen_error_lines:
+                error_messages.append(line_content) # Collect unique error lines
+                seen_error_lines.add(line_content)
 
     def replace_with_default(match: re.Match[str]):
         var = match.group(1)
@@ -58,9 +73,12 @@ def envsubst(template_str, env=os.environ):
         result = env.get(var, default_value)
         if result is None:
             print_error_line(template_str, match.span())
-            print(f"ERROR :: Missing template variable with default: {var}", file=sys.stderr)
-
-            exit(1)
+            error_messages.append(f"ERROR :: Missing template variable with default: {var}") # Collect error message
+            return "" # Return empty string for now, to allow processing to continue
+        
+        if replacements:
+            for old, new in replacements.items():
+                result = result.replace(old, new)
         return result
 
     def replace_without_default(match: re.Match[str]):
@@ -68,8 +86,12 @@ def envsubst(template_str, env=os.environ):
         result = env.get(var, None)
         if result is None:
             print_error_line(template_str, match.span())
-            print(f"ERROR :: Missing template variable: {var}", file=sys.stderr)
-            exit(1)
+            error_messages.append(f"ERROR :: Missing template variable: {var}") # Collect error message
+            return "" # Return empty string for now, to allow processing to continue
+        
+        if replacements:
+            for old, new in replacements.items():
+                result = result.replace(old, new)
         return result
 
     # Substitute variables with default values
@@ -80,12 +102,20 @@ def envsubst(template_str, env=os.environ):
     
     template_str = template_str.replace("__ESCAPED_DOLLAR__", "$")
 
+    if error_messages:
+        if on_error == 'exit':
+            for error_msg in error_messages:
+                print(error_msg, file=sys.stderr)
+            exit(1)
+        elif on_error == 'throw':
+            raise SubstitutionError(error_messages)
+
     return template_str
 
 
-def envsubst_load_file(template_file,env=os.environ):
+def envsubst_load_file(template_file, env=os.environ, replacements: Dict[str, str] = None, on_error: str = 'exit'):
     with open(template_file) as file:
-        return envsubst(file.read(),env)
+        return envsubst(file.read(), env, replacements, on_error)
 
 def main():
     if len(sys.argv) > 2:
@@ -100,10 +130,8 @@ def main():
         template_str = sys.stdin.read()
 
     result = envsubst(template_str)
-
     print(result)
 
 
 if __name__ == "__main__":
     main()
-

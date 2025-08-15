@@ -11,9 +11,11 @@ DESCRIPTION
 import os
 import re
 import sys
+from typing import Dict
+from .envsubst import SubstitutionError, envsubst as base_envsubst
 
 
-def envsubst(template_str, env=os.environ):
+def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, on_error: str = 'exit'):
     """Substitute environment variables in the template string, supporting default values."""
 
     # Regex for ${VARIABLE} with optional default
@@ -29,6 +31,10 @@ def envsubst(template_str, env=os.environ):
         if result is None:
             print(f"Missing template variable with default: {var}", file=sys.stderr)
             exit(1)
+        
+        if replacements:
+            for old, new in replacements.items():
+                result = result.replace(old, new)
         return result
 
     def replace_without_default(match):
@@ -37,6 +43,10 @@ def envsubst(template_str, env=os.environ):
         if result is None:
             print(f"Missing template variable: {var}", file=sys.stderr)
             exit(1)
+        
+        if replacements:
+            for old, new in replacements.items():
+                result = result.replace(old, new)
         return result
 
     # Substitute variables with default values
@@ -48,7 +58,7 @@ def envsubst(template_str, env=os.environ):
     return template_str
 
 
-def merge_files_from_directories(directories, file_extension=None):
+def merge_files_from_directories(directories, file_extension=None, on_error: str = 'exit'):
     merged_content = []
 
     for path in directories:
@@ -85,8 +95,11 @@ def merge_files_from_directories(directories, file_extension=None):
     # Strip extra empty lines from the beginning and end
     result = result.strip()
 
-    # Perform environment variable substitution on the final result
-    return envsubst(result)
+    # Define the replacements for '$' to '$$'
+    replacements_map = {"$": "$$"}
+
+    # Perform environment variable substitution on the final result with replacements
+    return base_envsubst(result, replacements=replacements_map, on_error=on_error)
 
 
 def main():

@@ -77,7 +77,10 @@ class DockerStack:
                 compose_data["configs"] = self._process_x_content(compose_data["configs"], self.docker.config,base_dir=base_dir,stack=stack)
             if "secrets" in compose_data:
                 compose_data["secrets"] = self._process_x_content(compose_data["secrets"], self.docker.secret,base_dir=base_dir,stack=stack)
-        return envsubst(yaml.dump(compose_data))
+        
+        # Define the replacements for '$' to '$$' for env variables in compose files
+        replacements_map = {"$": "$$"}
+        return envsubst(yaml.dump(compose_data), replacements=replacements_map)
     
     def decode_yaml(self,data:str)->dict:
         return yaml.safe_load(data)
@@ -94,10 +97,6 @@ class DockerStack:
         rendered_filename = Path(compose_file).with_name(
             f"{Path(compose_file).stem}-rendered{Path(compose_file).suffix}"
         )
-        with open(rendered_filename, "w") as f:
-            f.write(rendered_content)
-        with open(rendered_filename.as_posix()+".json","w") as f:
-            f.write(json.dumps(rendered_content,indent=2))
         return (rendered_filename,rendered_content)
 
 
@@ -366,9 +365,9 @@ def main(args:List[str]=None):
     # Ls command
     subparsers.add_parser("ls",help="List docker-stacks")
     
-    cat_parser = subparsers.add_parser("cat",help="Print the docker compose of specific version")
+    cat_parser = subparsers.add_parser("cat",help="Print the docker compose of specific version. Defaults to latest version if not specified.")
     cat_parser.add_argument("stack_name", help="Name of the stack")
-    cat_parser.add_argument("version", help="Stack version to cat")
+    cat_parser.add_argument("version", nargs='?', help="Stack version to cat. Defaults to latest if omitted.")
     
     checkout_parser = subparsers.add_parser("checkout",help="Deploy specific version of the stack")
     checkout_parser.add_argument("stack_name", help="Name of the stack")
@@ -403,7 +402,17 @@ def main(args:List[str]=None):
     elif args.command == "rm":
         docker.stack.rm(args.stack_name)
     elif args.command == 'cat':
-        print(docker.stack.cat(args.stack_name,args.version))
+        version_to_cat = args.version
+        if version_to_cat is None:
+            versions_list = docker.stack.versions(args.stack_name)
+            if versions_list:
+                # Assuming versions are integers, find the maximum
+                latest_version = max(int(v[0]) for v in versions_list if v[0].isdigit())
+                version_to_cat = str(latest_version)
+            else:
+                print(f"No versions found for stack '{args.stack_name}'.")
+                sys.exit(1)
+        print(docker.stack.cat(args.stack_name, version_to_cat))
     elif args.command == 'checkout':
         docker.stack.checkout(args.stack_name,args.version)
     elif args.command == 'versions' or args.command == "version":
