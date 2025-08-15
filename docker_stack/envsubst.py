@@ -11,106 +11,170 @@ DESCRIPTION
       with default - ${VARIABLE1:-somevalue}
 """
 
+from dataclasses import dataclass
 import os
 import re
 import sys
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
+
+
+@dataclass
+class LineCheckResult:
+    line_no: int
+    line_content: str
+    variable_name: Optional[str] = None  # None means no error
+    start_index: Optional[int] = None # Start index of the variable in the line_content
+
+    @property
+    def has_error(self) -> bool:
+        return self.variable_name is not None
+
+    def __str__(self):
+        if self.has_error:
+            return (f"ERROR :: Missing variable: '{self.variable_name}' "
+                    f"on line {self.line_no}: '{self.line_content}'")
+        return f"OK    :: Line {self.line_no}: '{self.line_content}'"
 
 
 class SubstitutionError(Exception):
-    """Custom exception to collect multiple substitution errors."""
-    def __init__(self, messages: List[str]):
-        self.messages = messages
-        super().__init__("\n".join(messages))
+    """Custom exception to collect multiple substitution errors with detailed information."""
+    def __init__(self, results: List[LineCheckResult], template_str: str):
+        self.results = results
+        self.template_lines = template_str.splitlines(keepends=False)
+        super().__init__(self._format_messages(results))
+
+    def _format_messages(self, results: List[LineCheckResult]) -> str:
+        formatted_messages = []
+        
+        # Group results by line number
+        errors_by_line = {}
+        for result in results:
+            if result.has_error:
+                if result.line_no not in errors_by_line:
+                    errors_by_line[result.line_no] = {
+                        'line_content': result.line_content,
+                        'variables': []
+                    }
+                errors_by_line[result.line_no]['variables'].append({
+                    'name': result.variable_name,
+                    'start_index': result.start_index
+                })
+        
+        # Sort line numbers
+        sorted_line_nos = sorted(errors_by_line.keys())
+        
+        last_printed_line = 0
+
+        for line_no in sorted_line_nos:
+            # Add separator if there's a gap from the last context block
+            if last_printed_line > 0 and (line_no - 2) > (last_printed_line + 1):
+                formatted_messages.append("")
+
+            # Determine context lines to display
+            start_context_line = max(last_printed_line + 1, line_no - 2)
+            end_context_line = min(len(self.template_lines), line_no + 2)
+
+            for current_ln in range(start_context_line, end_context_line + 1):
+                line_text = self.template_lines[current_ln - 1]
+                formatted_messages.append(f"{current_ln:3d}   {line_text}")
+                
+                # If this is an error line, add the caret line immediately after
+                if current_ln in errors_by_line:
+                    line_info = errors_by_line[current_ln]
+                    line_content = line_info['line_content']
+                    variables = sorted(line_info['variables'], key=lambda x: x['start_index'])
+                    
+                    caret_line_parts = [' '] * (len(line_content) + 6)
+                    
+                    for var_info in variables:
+                        caret_position = 6 + var_info['start_index']
+                        if caret_position < len(caret_line_parts):
+                            caret_line_parts[caret_position] = '^'
+                    
+                    caret_line = "".join(caret_line_parts).rstrip()
+                    if caret_line: # Only add if there are carets
+                        formatted_messages.append(caret_line)
+            
+            last_printed_line = end_context_line
+
+        return "\n".join(formatted_messages)
+
 
 
 def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, on_error: Literal['exit','throw'] = 'exit'):
     """Substitute environment variables in the template string, supporting default values."""
 
-    # Regex for ${VARIABLE} with optional default
-    pattern_with_default = re.compile(r"\$\{([^}:\s]+)(?::-(.*?))?\}")
+    # Combined regex for ${VAR:-default} and $VAR, and also $$
+    pattern = re.compile(r"\$\_ESCAPED_DOLLAR_|\$\{([^}:\s]+)(?::-(.*?))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)")
 
-    # Regex for $VARIABLE without default
-    pattern_without_default = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
+    # Handle escaped dollars
+    template_str = template_str.replace("$$", "$_ESCAPED_DOLLAR_")
 
-    template_str = template_str.replace("$$", "__ESCAPED_DOLLAR__")
-    
-    error_messages = [] # To store unique error messages
-    seen_error_lines = set() # To store unique error line contexts
+    lines = template_str.splitlines(True) # keepends=True
+    processed_lines = []
+    error_results: List[LineCheckResult] = []
 
-    def print_error_line(current_template_str, match_span):
-        """Helper function to collect unique error context lines."""
-        lines = current_template_str.splitlines()
+    for i, original_line in enumerate(lines):
+        line_no = i + 1
         
-        # Determine the start position and line
-        start_pos = match_span[0]
-        end_pos = match_span[1]
+        line_errors_raw = [] # Store (var_name, start_index) tuples
 
-        # Calculate line numbers based on character positions
-        char_count = 0
-        start_line = end_line = None
-        for i, line in enumerate(lines):
-            char_count += len(line) + 1  # +1 for the newline character
-            if start_line is None and char_count > start_pos:
-                start_line = i
-            if char_count >= end_pos:
-                end_line = i
-                break
+        def replacer(match: re.Match[str]):
+            if match.group(0) == '$_ESCAPED_DOLLAR_':
+                return '$$'
+            # Group 1, 2 for ${VAR:-default}
+            if match.group(1) is not None:
+                var = match.group(1)
+                default_value = match.group(2) if match.group(2) is not None else None
+                result = env.get(var, default_value)
+                if result is None:
+                    line_errors_raw.append((var, match.start()))
+                    return match.group(0) # Keep original if variable not found
+            # Group 3 for $VAR
+            else:
+                var = match.group(3)
+                result = env.get(var, None)
+                if result is None:
+                    line_errors_raw.append((var, match.start()))
+                    return match.group(0) # Keep original if variable not found
+            
+            if replacements:
+                for old, new in replacements.items():
+                    result = result.replace(old, new)
+            return result
+
+        processed_line = pattern.sub(replacer, original_line)
         
-        # Display lines before, the error line, and after (with line numbers)
-        start = max(start_line - 1, 0)
-        end = min(end_line + 1, len(lines) - 1)
-
-        for i in range(start, end + 1):
-            line_content = f"{i + 1}: {lines[i]}"
-            if line_content not in seen_error_lines:
-                error_messages.append(line_content) # Collect unique error lines
-                seen_error_lines.add(line_content)
-
-    def replace_with_default(match: re.Match[str]):
-        var = match.group(1)
-        default_value = match.group(2) if match.group(2) is not None else None
-        result = env.get(var, default_value)
-        if result is None:
-            print_error_line(template_str, match.span())
-            error_messages.append(f"ERROR :: Missing template variable with default: {var}") # Collect error message
-            return "" # Return empty string for now, to allow processing to continue
+        processed_lines.append(processed_line)
         
-        if replacements:
-            for old, new in replacements.items():
-                result = result.replace(old, new)
-        return result
+        if line_errors_raw:
+            # The original line content for error reporting should not have the escaped dollar placeholder.
+            # It should also retain its leading/trailing whitespace for accurate caret positioning.
+            error_line_content_for_report = original_line.replace("$_ESCAPED_DOLLAR_", "$$").rstrip('\n') # Remove only trailing newline
+            
+            # Use a set of tuples to store unique (var_name, start_index) pairs for this line
+            unique_errors_on_line = set()
+            for var_name, start_index in line_errors_raw:
+                unique_errors_on_line.add((var_name, start_index))
 
-    def replace_without_default(match: re.Match[str]):
-        var = match.group(1)
-        result = env.get(var, None)
-        if result is None:
-            print_error_line(template_str, match.span())
-            error_messages.append(f"ERROR :: Missing template variable: {var}") # Collect error message
-            return "" # Return empty string for now, to allow processing to continue
-        
-        if replacements:
-            for old, new in replacements.items():
-                result = result.replace(old, new)
-        return result
+            for var_name, start_index in sorted(list(unique_errors_on_line), key=lambda x: x[1]): # Sort by start_index
+                error_results.append(LineCheckResult(line_no=line_no, line_content=error_line_content_for_report, variable_name=var_name, start_index=start_index))
 
-    # Substitute variables with default values
-    template_str = pattern_with_default.sub(replace_with_default, template_str)
-
-    # Substitute variables without default values
-    template_str = pattern_without_default.sub(replace_without_default, template_str)
-    
-    template_str = template_str.replace("__ESCAPED_DOLLAR__", "$")
-
-    if error_messages:
+    if error_results:
+        # Sort errors by line number, then by start_index
+        error_results.sort(key=lambda x: (x.line_no, x.start_index))
         if on_error == 'exit':
-            for error_msg in error_messages:
-                print(error_msg, file=sys.stderr)
+            error_output = SubstitutionError(error_results, template_str)._format_messages(error_results) # Pass template_str
+            print(error_output, file=sys.stderr)
             exit(1)
         elif on_error == 'throw':
-            raise SubstitutionError(error_messages)
+            raise SubstitutionError(error_results, template_str) # Pass template_str
 
-    return template_str
+    result_str = "".join(processed_lines)
+    # Restore escaped dollars
+    result_str = result_str.replace("$_ESCAPED_DOLLAR_", "$$")
+
+    return result_str
 
 
 def envsubst_load_file(template_file, env=os.environ, replacements: Dict[str, str] = None, on_error: str = 'exit'):

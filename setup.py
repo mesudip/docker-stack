@@ -8,7 +8,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Sudip Bhattarai",
     author_email="sudip@bhattarai.me",
-    url="https://github.com/mesuidp/docker-stack",  # Replace with your project URL
+    url="https://github.com/mesudip/docker-stack",  # Replace with your project URL
     packages=find_packages(),
     install_requires=[
         "PyYAML"
