@@ -38,9 +38,10 @@ class LineCheckResult:
 
 class SubstitutionError(Exception):
     """Custom exception to collect multiple substitution errors with detailed information."""
-    def __init__(self, results: List[LineCheckResult], template_str: str):
+    def __init__(self, results: List[LineCheckResult], template_str: str, underline_char: str = '\u0333'):
         self.results = results
         self.template_lines = template_str.splitlines(keepends=False)
+        self.underline_char = underline_char
         super().__init__(self._format_messages(results))
 
     def _format_messages(self, results: List[LineCheckResult]) -> str:
@@ -76,24 +77,28 @@ class SubstitutionError(Exception):
 
             for current_ln in range(start_context_line, end_context_line + 1):
                 line_text = self.template_lines[current_ln - 1]
-                formatted_messages.append(f"{current_ln:3d}   {line_text}")
                 
-                # If this is an error line, add the caret line immediately after
+                # If this is an error line, apply the underlining
                 if current_ln in errors_by_line:
-                    line_info = errors_by_line[current_ln]
-                    line_content = line_info['line_content']
-                    variables = sorted(line_info['variables'], key=lambda x: x['start_index'])
+                    current_line_errors = errors_by_line[current_ln]['variables']
                     
-                    caret_line_parts = [' '] * (len(line_content) + 6)
+                    # Sort errors by start_index in reverse to avoid index shifting issues
+                    current_line_errors.sort(key=lambda x: x['start_index'], reverse=True)
                     
-                    for var_info in variables:
-                        caret_position = 6 + var_info['start_index']
-                        if caret_position < len(caret_line_parts):
-                            caret_line_parts[caret_position] = '^'
+                    modified_line_text_chars = list(line_text) # Convert to list for mutability
                     
-                    caret_line = "".join(caret_line_parts).rstrip()
-                    if caret_line: # Only add if there are carets
-                        formatted_messages.append(caret_line)
+                    for var_info in current_line_errors:
+                        var_name = var_info['name']
+                        start_idx = var_info['start_index']
+                        
+                        # Insert underline_char after each character of the variable name
+                        for k in range(len(var_name) - 1, -1, -1):
+                            insert_pos = start_idx + k + 1 # Position after the character
+                            modified_line_text_chars.insert(insert_pos, self.underline_char)
+                    
+                    line_text = "".join(modified_line_text_chars)
+
+                formatted_messages.append(f"{current_ln:3d}   {line_text}")
             
             last_printed_line = end_context_line
 
@@ -128,14 +133,14 @@ def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, 
                 default_value = match.group(2) if match.group(2) is not None else None
                 result = env.get(var, default_value)
                 if result is None:
-                    line_errors_raw.append((var, match.start()))
+                    line_errors_raw.append((var, match.start(1))) # Use match.start(1) for ${VAR}
                     return match.group(0) # Keep original if variable not found
             # Group 3 for $VAR
             else:
                 var = match.group(3)
                 result = env.get(var, None)
                 if result is None:
-                    line_errors_raw.append((var, match.start()))
+                    line_errors_raw.append((var, match.start(3))) # Use match.start(3) for $VAR
                     return match.group(0) # Keep original if variable not found
             
             if replacements:

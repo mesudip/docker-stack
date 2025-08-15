@@ -187,11 +187,9 @@ Line 6: Final line.
     expected_error_message = """
   2   Line 1: No variables here.
   3   Line 2: A valid variable ${VALID_VAR}.
-  4   Line 3: Missing one variable here -> $MISSING_1 <-
-                                           ^
+  4   Line 3: Missing one variable here -> $M\u0333I\u0333S\u0333S\u0333I\u0333N\u0333G\u0333_\u03331\u0333 <-
   5   Line 4: Another line without variables.
-  6   Line 5: Two missing variables -> $MISSING_2 and $MISSING_3 <-
-                                       ^              ^
+  6   Line 5: Two missing variables -> $M\u0333I\u0333S\u0333S\u0333I\u0333N\u0333G\u0333_\u03332\u0333 and $M\u0333I\u0333S\u0333S\u0333I\u0333N\u0333G\u0333_\u03333\u0333 <-
   7   Line 6: Final line.
 """
     # We need to compare them line by line, ignoring leading/trailing whitespace on each line
