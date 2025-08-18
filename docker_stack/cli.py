@@ -97,6 +97,8 @@ class DockerStack:
         rendered_filename = Path(compose_file).with_name(
             f"{Path(compose_file).stem}-rendered{Path(compose_file).suffix}"
         )
+        with open(rendered_filename, "w") as f:
+            f.write(rendered_content)
         return (rendered_filename,rendered_content)
 
 
