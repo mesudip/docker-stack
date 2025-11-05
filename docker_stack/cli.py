@@ -10,7 +10,7 @@ import os
 import yaml
 import json
 from docker_stack.docker_objects import DockerConfig, DockerObjectManager, DockerSecret
-from docker_stack.helpers import Command
+from docker_stack.helpers import Command, generate_secret
 from docker_stack.registry import DockerRegistry
 from .envsubst import envsubst, envsubst_load_file
 
@@ -80,7 +80,7 @@ class DockerStack:
         
         # Define the replacements for '$' to '$$' for env variables in compose files
         replacements_map = {"$": "$$"}
-        return envsubst(yaml.dump(compose_data), replacements=replacements_map)
+        return envsubst(yaml.dump(compose_data,sort_keys=False), replacements=replacements_map)
     
     def decode_yaml(self,data:str)->dict:
         return yaml.safe_load(data)
@@ -110,23 +110,44 @@ class DockerStack:
         """
         processed_objects = {}
         
-        def add_obj(name,data):
-            (object_name,command)=manager.create(name, data,stack=stack)                
+        def add_obj(name, data, is_generated_secret=False):
+            labels = []
+            if is_generated_secret:
+                labels.append("mesudip.secret.generated=true")
+            (object_name, command) = manager.create(name, data, labels=labels, stack=stack)                
             if not command.isNop():
                 self.commands.append(command)
-            processed_objects[name] = {"name": object_name,"external": True}
+            processed_objects[name] = {"name": object_name, "external": True}
+
         for name, details in objects.items():
             if isinstance(details, dict) and "x-content" in details:
-                add_obj(name,details['x-content'])
+                add_obj(name, details['x-content'])
             elif isinstance(details, dict) and 'x-template' in details:
-                add_obj(name,envsubst(details['x-content'],os.environ))
+                add_obj(name, envsubst(details['x-content'], os.environ))
             elif isinstance(details, dict) and 'x-template-file' in details:
-                filename=os.path.join(base_dir,details['x-template-file'])
-                add_obj(name,envsubst_load_file(filename,os.environ))
+                filename = os.path.join(base_dir, details['x-template-file'])
+                add_obj(name, envsubst_load_file(filename, os.environ))
             elif isinstance(details, dict) and 'file' in details:
-                filename=os.path.join(base_dir,details['file'])
+                filename = os.path.join(base_dir, details['file'])
                 with open(filename) as file:
-                    add_obj(name,file.read())
+                    add_obj(name, file.read())
+            elif isinstance(details, dict) and 'x-generate' in details and manager.object_type == "secret":
+                generate_options = details['x-generate']
+                secret_content = ""
+                if isinstance(generate_options, bool) and generate_options:
+                    secret_content = generate_secret()
+                elif isinstance(generate_options, int):
+                    secret_content = generate_secret(length=generate_options)
+                elif isinstance(generate_options, dict):
+                    secret_content = generate_secret(
+                        length=generate_options.get('length'),
+                        numbers=generate_options.get('numbers', True),
+                        special=generate_options.get('special', True),
+                        uppercase=generate_options.get('uppercase', True)
+                    )
+                else:
+                    raise ValueError(f"Invalid x-generate value for secret {name}: {generate_options}")
+                add_obj(name, secret_content, is_generated_secret=True)
             else:
                 processed_objects[name] = details
         return processed_objects

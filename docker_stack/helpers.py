@@ -1,6 +1,43 @@
+import random
+import string
 import subprocess
 import sys
-from typing import List, Optional
+from typing import List, Optional, Union, Dict
+
+
+def generate_secret(
+    length: Union[int, None] = None,
+    numbers: bool = True,
+    special: bool = True,
+    uppercase: bool = True,
+) -> str:
+    """
+    Generates a random secret string based on specified criteria.
+
+    Args:
+        length: The desired length of the secret. If None, a random length between 12 and 20 is used.
+        numbers: If True, include numbers in the secret.
+        special: If True, include special characters in the secret.
+        uppercase: If True, include uppercase letters in the secret.
+
+    Returns:
+        A randomly generated secret string.
+    """
+    if length is None:
+        length = random.randint(12, 20)
+
+    characters = string.ascii_lowercase
+    if uppercase:
+        characters += string.ascii_uppercase
+    if numbers:
+        characters += string.digits
+    if special:
+        characters += string.punctuation
+
+    if not characters:
+        raise ValueError("No character types selected for secret generation.")
+
+    return "".join(random.choice(characters) for _ in range(length))
 
 
 def run_cli_command(

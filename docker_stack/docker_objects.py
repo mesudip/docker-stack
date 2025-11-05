@@ -1,7 +1,8 @@
+import base64
 import hashlib
 import re
 import json
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from docker_stack.helpers import Command, run_cli_command  # Import the helper function
 
 
@@ -48,8 +49,9 @@ class DockerObjectManager:
         self, object_name, object_content, labels: List[str] = [],stack=None
     ) -> Tuple[str, Command]:
         sha_hash = self.calculate_hash(object_name, object_content)
-        if stack :
-            labels=labels + ["com.docker.stack.namespace="+stack]
+        if stack:
+            labels = labels + ["com.docker.stack.namespace=" + stack]
+
         # Check if any version of the object already exists by its label
         command = [
             "docker",
@@ -65,23 +67,42 @@ class DockerObjectManager:
         # Parse existing versions
         existing_versions = {}
         max_version = 0
+        last_object_info: Optional[Dict] = None
 
         for line in output.splitlines():
             object_info = json.loads(line)
             object_name_in_docker = object_info["Name"]
             if object_name_in_docker == object_name:
-                max_version = max(max_version, 1)
-                existing_versions[1] = object_info
+                current_version = 1
             else:
                 match = re.search(r"_(v\d+)$", object_name_in_docker)
-                if match:
-                    version = int(match.group(1)[1:])
-                    max_version = max(version, max_version)
-                    existing_versions[version] = object_info
+                current_version = int(match.group(1)[1:]) if match else 0
+
+            if current_version > max_version:
+                max_version = current_version
+                last_object_info = object_info
+            existing_versions[current_version] = object_info
+
+        # Determine if the new object has the 'generated' flag
+        new_object_is_generated = "mesudip.secret.generated=true" in labels
+
+        if max_version > 0 and self.object_type == "secret":
+            # Retrieve labels of the last existing object
+            last_object_labels_str = last_object_info["Labels"]
+            last_object_labels = parse_labels(last_object_labels_str)
+            last_object_is_generated = last_object_labels.get("mesudip.secret.generated") == "true"
+
+            # Case 2: Generated -> Generated. If there is "generated" flag in the last latest version and this new create command also has "generated" flag, return the same old one
+            if last_object_is_generated and new_object_is_generated:
+                if self.log:
+                    print(
+                        f"Secret {object_name} was previously generated. Reusing existing secret: {last_object_info['Name']}"
+                    )
+                return last_object_info["Name"], Command.nop
 
         # Determine the next version number
         new_version_suffix = ""
-        if len(existing_versions) > 0:
+        if max_version > 0:
             new_version = max_version + 1
             new_version_suffix = f"_v{new_version}"
         else:
@@ -90,11 +111,11 @@ class DockerObjectManager:
         new_object_name = f"{object_name}{new_version_suffix}"
 
         # Check if the SHA hash for the new content already exists in any version
+        # This check is still relevant for non-generated secrets or when a generated secret is being overridden
         existing_sha_hash = None
         matching_object = None
 
         for object_info in existing_versions.values():
-            object_name_in_docker = object_info["Name"]
             parsed_labels = parse_labels(object_info["Labels"])
             object_sha_hash = parsed_labels.get("sha256")
 
@@ -112,7 +133,7 @@ class DockerObjectManager:
             return existing_name, Command.nop
 
         if self.log:
-            print(f"SHA mismatch. Creating a new version: {new_object_name}")
+            print(f"SHA mismatch or new generation. Creating a new version: {new_object_name}")
         labels = [
             f"mesudip.object.version={new_version:01d}",
             f"mesudip.object.name={object_name}",
