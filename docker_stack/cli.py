@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 import os
 import yaml
 import json
@@ -56,6 +56,7 @@ class DockerStack:
     def __init__(self, docker: Docker):
         self.docker = docker
         self.commands: List[Command] = []
+        self.generated_secrets: Dict[str, str] = {} # To store newly generated secrets
     
     def read_compose_file(self,compose_file)->dict:
         with open(compose_file) as f:
@@ -117,6 +118,9 @@ class DockerStack:
             (object_name, command) = manager.create(name, data, labels=labels, stack=stack)                
             if not command.isNop():
                 self.commands.append(command)
+                # If a new secret was actually created (not just reused), store it
+                if is_generated_secret:
+                    self.generated_secrets[name] = data
             processed_objects[name] = {"name": object_name, "external": True}
 
         for name, details in objects.items():
@@ -132,8 +136,12 @@ class DockerStack:
                 with open(filename) as file:
                     add_obj(name, file.read())
             elif isinstance(details, dict) and 'x-generate' in details and manager.object_type == "secret":
+                is_generated_secret = True
                 generate_options = details['x-generate']
                 secret_content = ""
+
+                # Determine the content to be used for the secret
+                # This logic is now simplified as DockerObjectManager.create handles persistence
                 if isinstance(generate_options, bool) and generate_options:
                     secret_content = generate_secret()
                 elif isinstance(generate_options, int):
@@ -147,6 +155,8 @@ class DockerStack:
                     )
                 else:
                     raise ValueError(f"Invalid x-generate value for secret {name}: {generate_options}")
+                
+                # Call add_obj with the potentially new secret content and the generated flag
                 add_obj(name, secret_content, is_generated_secret=True)
             else:
                 processed_objects[name] = details
@@ -288,7 +298,8 @@ class DockerStack:
             cmd.insert(3, "--with-registry-auth")
         self.commands.append(Command(cmd,give_console=True))
 
-    def deploy(self, stack_name, compose_file, with_registry_auth=False,tag=None):
+    def deploy(self, stack_name, compose_file, with_registry_auth=False, tag=None, show_generated=True):
+        self.generated_secrets = {} # Reset for each deployment
         rendered_filename, rendered_content = self.render_compose_file(compose_file,stack=stack_name,include_build=False)
         labels = [f"mesudip.stack.name={stack_name}"]
         if tag:
@@ -301,6 +312,12 @@ class DockerStack:
         if with_registry_auth:
             cmd.insert(3, "--with-registry-auth")
         self.commands.append(Command(cmd,give_console=True))
+
+        if show_generated and self.generated_secrets:
+            print("\n----- Newly Generated Secrets -----")
+            for name, content in self.generated_secrets.items():
+                print(f"{name}: {content}")
+            print("---------------------------------\n")
 
     def push(self, compose_file):
         compose_data = self.read_compose_file(compose_file)
@@ -380,6 +397,7 @@ def main(args:List[str]=None):
     deploy_parser.add_argument("compose_file", help="Path to the compose file")
     deploy_parser.add_argument("--with-registry-auth", action="store_true", help="Use registry authentication")
     deploy_parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
+    deploy_parser.add_argument("--show-generated", action="store_true", default=True, help="Show newly generated secrets after deployment")
 
     # Remove subcommand
     rm_parser = subparsers.add_parser("rm", help="Remove a deployed stack")
@@ -407,6 +425,7 @@ def main(args:List[str]=None):
     parser.add_argument("-u", "--user", help="Registry credentials in format hostname:username:password", action="append", required=False, default=[])
     parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
     parser.add_argument("-ro",'-r',"--ro","--r", "--dry-run", action="store_true", help="Print commands, don't execute them", required=False)
+    parser.add_argument("--show-generated", action="store_true", default=True, help="Show newly generated secrets after deployment")
     
     args = parser.parse_args(args if args else sys.argv[1:])
     
@@ -418,7 +437,7 @@ def main(args:List[str]=None):
     elif args.command == "push":
         docker.stack.push(args.compose_file)
     elif args.command == "deploy":
-        docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth,tag=args.tag)
+        docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth, tag=args.tag, show_generated=args.show_generated)
     elif args.command == "ls":
         docker.stack.ls()
 
