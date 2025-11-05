@@ -47,7 +47,7 @@ def run_cli_command(
     log: bool = True,
     shell: bool = False,
     interactive: bool = False,
-    cwd=None
+    cwd=None,
 ) -> str:
     """
     Run a CLI command and return its output.
@@ -64,22 +64,14 @@ def run_cli_command(
         The stdout of the command as a string, or None if interactive mode is enabled.
     """
     if log:
-        print("> " + " ".join(command),flush=True)
+        print("> " + " ".join(command), flush=True)
 
     try:
         if interactive:
-            result = subprocess.run(command, shell=shell,cwd=cwd)
+            result = subprocess.run(command, shell=shell, cwd=cwd)
             return None
         else:
-            result = subprocess.run(
-                command,
-                input=stdin,
-                text=True,
-                capture_output=True,
-                check=raise_error,
-                shell=shell,
-                cwd=cwd
-            )
+            result = subprocess.run(command, input=stdin, text=True, capture_output=True, check=raise_error, shell=shell, cwd=cwd)
             return result.stdout.strip()
     except subprocess.CalledProcessError as e:
         # Log the error and re-raise the exception
@@ -95,10 +87,7 @@ class Command:
     def isNop(self):
         return self == Command.nop
 
-    def __init__(
-        self, command: List[str], stdin: Optional[str] = None, log: bool = True, id=None,give_console=False
-        ,cwd:str=None
-    ):
+    def __init__(self, command: List[str], stdin: Optional[str] = None, log: bool = True, id=None, give_console=False, cwd: str = None):
         """
         Initialize a Command object.
 
@@ -111,9 +100,8 @@ class Command:
         self.stdin = stdin
         self.log = log
         self.id = id
-        self.give_console=give_console
-        self.cwd=cwd
-        
+        self.give_console = give_console
+        self.cwd = cwd
 
     def execute(self, log: Optional[bool] = None) -> str:
         """
@@ -130,7 +118,7 @@ class Command:
         # Use the provided log value if available, otherwise use the one from the constructor
         use_log = log if log is not None else self.log
         if use_log:
-            print("> " + " ".join(self.command),flush=True)
+            print("> " + " ".join(self.command), flush=True)
 
         if not self.stdin:
             # if self.give_console:
@@ -139,11 +127,11 @@ class Command:
             #     process.wait()
             #     return process
             # else:
-            result= subprocess.run(self.command)
-            if result.returncode!= 0:
+            result = subprocess.run(self.command)
+            if result.returncode != 0:
                 sys.exit(result.returncode)
         else:
-            return run_cli_command(self.command, stdin=self.stdin, log=False, shell=False,cwd=self.cwd)
+            return run_cli_command(self.command, stdin=self.stdin, log=False, shell=False, cwd=self.cwd)
 
     def __str__(self) -> str:
         """

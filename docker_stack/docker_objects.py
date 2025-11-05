@@ -2,7 +2,7 @@ import base64
 import hashlib
 import re
 import json
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from docker_stack.helpers import Command, run_cli_command  # Import the helper function
 
 
@@ -11,12 +11,8 @@ class DockerObjectManager:
         self.object_type = object_type
         self.log = log
 
-    def _create(
-        self, object_name, object_content, labels: List[str] = [], sha_hash=None
-    ):
-        sha_hash = (
-            sha_hash if sha_hash else self.calculate_hash(object_name, object_content)
-        )
+    def _create(self, object_name, object_content, labels: List[str] = [], sha_hash=None):
+        sha_hash = sha_hash if sha_hash else self.calculate_hash(object_name, object_content)
         command = ["docker", self.object_type, "create"]
         command.append("--label")
         command.append(f"sha256={sha_hash}")
@@ -45,9 +41,7 @@ class DockerObjectManager:
         except Exception:
             return False
 
-    def create(
-        self, object_name, object_content, labels: List[str] = [],stack=None
-    ) -> Tuple[str, Command]:
+    def create(self, object_name, object_content, labels: List[str] = [], stack=None) -> Tuple[str, Command]:
         sha_hash = self.calculate_hash(object_name, object_content)
         if stack:
             labels = labels + ["com.docker.stack.namespace=" + stack]
@@ -95,9 +89,7 @@ class DockerObjectManager:
             # Case 2: Generated -> Generated. If there is "generated" flag in the last latest version and this new create command also has "generated" flag, return the same old one
             if last_object_is_generated and new_object_is_generated:
                 if self.log:
-                    print(
-                        f"Secret {object_name} was previously generated. Reusing existing secret: {last_object_info['Name']}"
-                    )
+                    print(f"Secret {object_name} was previously generated. Reusing existing secret: {last_object_info['Name']}")
                 return last_object_info["Name"], Command.nop
 
         # Determine the next version number
@@ -127,9 +119,7 @@ class DockerObjectManager:
         if existing_sha_hash == sha_hash:
             existing_name = matching_object["Name"]
             if self.log:
-                print(
-                    f"{self.object_type.capitalize()} {existing_name} already exists with the same SHA hash. No update needed."
-                )
+                print(f"{self.object_type.capitalize()} {existing_name} already exists with the same SHA hash. No update needed.")
             return existing_name, Command.nop
 
         if self.log:
@@ -138,16 +128,12 @@ class DockerObjectManager:
             f"mesudip.object.version={new_version:01d}",
             f"mesudip.object.name={object_name}",
         ] + labels
-        return new_object_name, self._create(
-            new_object_name, object_content, labels, sha_hash=sha_hash
-        )
+        return new_object_name, self._create(new_object_name, object_content, labels, sha_hash=sha_hash)
 
-    def increment(
-        self, object_name, object_content, labels: List[str] = [],stack=None
-    ) -> Tuple[str, Command]:
+    def increment(self, object_name, object_content, labels: List[str] = [], stack=None) -> Tuple[str, Command]:
         sha_hash = self.calculate_hash(object_name, object_content)
-        if stack :
-            labels=labels + ["com.docker.stack.namespace="+stack]
+        if stack:
+            labels = labels + ["com.docker.stack.namespace=" + stack]
         # Check if any version of the object already exists by its label
         command = [
             "docker",
@@ -208,9 +194,58 @@ class DockerObjectManager:
                 f"mesudip.object.version={new_version:01d}",
                 f"mesudip.object.name={object_name}",
             ] + labels
-            return new_object_name, self._create(
-                new_object_name, object_content, labels, sha_hash=sha_hash
-            )
+            return new_object_name, self._create(new_object_name, object_content, labels, sha_hash=sha_hash)
+
+    def prune(self, keep: int) -> List[Command]:
+        """
+        Removes old versions of Docker objects (configs or secrets), keeping only the 'keep' most recent.
+
+        Args:
+            keep: The number of most recent versions to keep for each object name.
+
+        Returns:
+            A list of Command objects for deleting the old versions.
+        """
+        deletion_commands: List[Command] = []
+
+        # List all objects of this type
+        command = [
+            "docker",
+            self.object_type,
+            "ls",
+            "--filter",
+            "label=mesudip.object.name",  # Filter for objects managed by docker-stack
+            "--format",
+            "{{json .}}",
+        ]
+        output = run_cli_command(command, raise_error=True, log=self.log)
+
+        # Group objects by their base name
+        objects_by_name: Dict[str, List[Dict]] = {}
+        for line in output.splitlines():
+            object_info = json.loads(line)
+            parsed_labels = parse_labels(object_info["Labels"])
+            base_name = parsed_labels.get("mesudip.object.name")
+            version = int(parsed_labels.get("mesudip.object.version", 0))
+
+            if base_name and version > 0:
+                if base_name not in objects_by_name:
+                    objects_by_name[base_name] = []
+                objects_by_name[base_name].append({"name": object_info["Name"], "version": version, "id": object_info["ID"]})
+
+        for base_name, versions_list in objects_by_name.items():
+            # Sort versions in descending order
+            versions_list.sort(key=lambda x: x["version"], reverse=True)
+
+            # Identify objects to delete
+            to_delete = versions_list[keep:]
+
+            if to_delete:
+                names_to_delete = [obj["name"] for obj in to_delete]
+                if self.log:
+                    print(f"Pruning {self.object_type}s: {', '.join(names_to_delete)}")
+                deletion_commands.append(Command(["docker", self.object_type, "rm"] + names_to_delete))
+        return deletion_commands
 
 
 class DockerConfig(DockerObjectManager):

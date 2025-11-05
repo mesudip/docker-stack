@@ -12,9 +12,7 @@ def merge_files_from_directories(directories):
                 if filename.endswith(".conf"):  # Only consider .conf files
                     filepath = os.path.join(path, filename)
                     with open(filepath, "r") as file:
-                        content = (
-                            file.read().strip()
-                        )  # Strip leading/trailing whitespace
+                        content = file.read().strip()  # Strip leading/trailing whitespace
                         if content:  # Add only non-empty content
                             # Add directory and filename as a comment at the start of the content
                             merged_content.append(f"# {path}/{filename}\n{content}")
@@ -26,9 +24,7 @@ def merge_files_from_directories(directories):
                     # Add the file name as a comment at the start of the content
                     merged_content.append(f"# {path}\n{content}")
         else:
-            print(
-                f"Warning: '{path}' is not a valid directory or .conf file. Skipping."
-            )
+            print(f"Warning: '{path}' is not a valid directory or .conf file. Skipping.")
 
     # Join the content with a single newline between entries
     result = "\n\n".join(merged_content)
@@ -43,9 +39,7 @@ def merge_files_from_directories(directories):
 if __name__ == "__main__":
     # Take directories or .conf files from command-line arguments
     if len(sys.argv) < 2:
-        print(
-            "Usage: python merge_files.py <directory1|file1.conf> <directory2|file2.conf> ..."
-        )
+        print("Usage: python merge_files.py <directory1|file1.conf> <directory2|file2.conf> ...")
         sys.exit(1)
 
     paths_to_read = sys.argv[1:]

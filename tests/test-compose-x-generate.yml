@@ -1,0 +1,29 @@
+version: '3.8'
+
+secrets:
+  my_simple_secret:
+    x-generate: true
+  my_length_secret:
+    x-generate: 30
+  my_complex_secret:
+    x-generate:
+      length: 25
+      numbers: false
+      special: true
+      uppercase: true
+  my_no_special_secret:
+    x-generate:
+      length: 15
+      numbers: true
+      special: false
+      uppercase: false
+
+services:
+  my_app:
+    image: alpine/git
+    command: ["sh", "-c", "echo 'Hello from my_app'"]
+    secrets:
+      - my_simple_secret
+      - my_length_secret
+      - my_complex_secret
+      - my_no_special_secret

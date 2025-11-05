@@ -1,6 +1,7 @@
 import yaml
 import os
 
+
 def read_compose_file(compose_file_path):
     """
     Reads a Docker Compose YAML file and returns its contents as a dictionary.

@@ -15,7 +15,7 @@ from typing import Dict
 from .envsubst import SubstitutionError, envsubst as base_envsubst
 
 
-def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, on_error: str = 'exit'):
+def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, on_error: str = "exit"):
     """Substitute environment variables in the template string, supporting default values."""
 
     # Regex for ${VARIABLE} with optional default
@@ -31,7 +31,7 @@ def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, 
         if result is None:
             print(f"Missing template variable with default: {var}", file=sys.stderr)
             exit(1)
-        
+
         if replacements:
             for old, new in replacements.items():
                 result = result.replace(old, new)
@@ -43,7 +43,7 @@ def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, 
         if result is None:
             print(f"Missing template variable: {var}", file=sys.stderr)
             exit(1)
-        
+
         if replacements:
             for old, new in replacements.items():
                 result = result.replace(old, new)
@@ -58,7 +58,7 @@ def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, 
     return template_str
 
 
-def merge_files_from_directories(directories, file_extension=None, on_error: str = 'exit'):
+def merge_files_from_directories(directories, file_extension=None, on_error: str = "exit"):
     merged_content = []
 
     for path in directories:
@@ -68,15 +68,11 @@ def merge_files_from_directories(directories, file_extension=None, on_error: str
                 if not file_extension or filename.endswith(file_extension):
                     filepath = os.path.join(path, filename)
                     with open(filepath, "r") as file:
-                        content = (
-                            file.read().strip()
-                        )  # Strip leading/trailing whitespace
+                        content = file.read().strip()  # Strip leading/trailing whitespace
                         if content:  # Add only non-empty content
                             # Add directory and filename as a comment at the start of the content
                             merged_content.append(f"# {path}/{filename}\n{content}")
-        elif os.path.isfile(path) and (
-            not file_extension or path.endswith(file_extension)
-        ):
+        elif os.path.isfile(path) and (not file_extension or path.endswith(file_extension)):
             # If the path is a file with the specified extension, read its content
             with open(path, "r") as file:
                 content = file.read().strip()  # Strip leading/trailing whitespace
