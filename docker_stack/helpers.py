@@ -26,18 +26,29 @@ def generate_secret(
     if length is None:
         length = random.randint(12, 20)
 
+    # Always start with a letter (uppercase or lowercase)
+    first_char_pool = string.ascii_lowercase + string.ascii_uppercase
+    first_char = random.choice(first_char_pool)
+
+    # Prepare the character pool for the rest of the secret
     characters = string.ascii_lowercase
     if uppercase:
         characters += string.ascii_uppercase
     if numbers:
         characters += string.digits
     if special:
-        characters += string.punctuation
+        # Exclude '$', single quote, and double quote characters
+        excluded_chars = "$'\"\\"
+        allowed_punctuation = "".join(c for c in string.punctuation if c not in excluded_chars)
+        characters += allowed_punctuation
 
     if not characters:
         raise ValueError("No character types selected for secret generation.")
 
-    return "".join(random.choice(characters) for _ in range(length))
+    # Generate the rest of the string
+    secret = [first_char] + [random.choice(characters) for _ in range(length - 1)]
+
+    return "".join(secret)
 
 
 def run_cli_command(
