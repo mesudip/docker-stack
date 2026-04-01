@@ -123,16 +123,19 @@ def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, 
             # Group 1, 2 for ${VAR:-default}
             if match.group(1) is not None:
                 var = match.group(1)
-                default_value = match.group(2) if match.group(2) is not None else None
-                result = env.get(var, default_value)
-                if result is None:
+                has_default = match.group(2) is not None
+                default_value = match.group(2) if has_default else None
+                result = env.get(var, None)
+                if result in (None, "") and has_default:
+                    result = default_value
+                if result in (None, "") and not has_default:
                     line_errors_raw.append((var, match.start(1)))  # Use match.start(1) for ${VAR}
                     return match.group(0)  # Keep original if variable not found
             # Group 3 for $VAR
             else:
                 var = match.group(3)
                 result = env.get(var, None)
-                if result is None:
+                if result in (None, ""):
                     line_errors_raw.append((var, match.start(3)))  # Use match.start(3) for $VAR
                     return match.group(0)  # Keep original if variable not found
 

@@ -1,23 +1,196 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+from dataclasses import dataclass
 import re
+import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import os
 import yaml
 import json
 from docker_stack.docker_objects import DockerConfig, DockerObjectManager, DockerSecret
 from docker_stack.helpers import Command, generate_secret
 from docker_stack.registry import DockerRegistry
-from .envsubst import envsubst, envsubst_load_file
+from .envsubst import LineCheckResult, SubstitutionError, envsubst, envsubst_load_file
+
+
+@dataclass
+class EnvFileEntry:
+    key: str
+    value: str
+    line_no: int
+    line_content: str
+    value_start_index: int
+    value_inner_offset: int
+
+
+class EnvFileResolutionError(Exception):
+    def __init__(self, env_file: str, reason: str, results: List[LineCheckResult], template_lines: List[str]):
+        self.env_file = env_file
+        self.reason = reason
+        self.results = results
+        self.template_lines = template_lines
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        formatted_lines = [f"{self.reason} in {self.env_file}:"]
+        errors_by_line = {}
+
+        for result in self.results:
+            if result.line_no not in errors_by_line:
+                errors_by_line[result.line_no] = {"line_content": result.line_content, "variables": []}
+            errors_by_line[result.line_no]["variables"].append({"name": result.variable_name, "start_index": result.start_index})
+
+        for line_no in sorted(errors_by_line):
+            line_chars = list(errors_by_line[line_no]["line_content"])
+            for item in sorted(errors_by_line[line_no]["variables"], key=lambda x: x["start_index"], reverse=True):
+                for idx in range(len(item["name"]) - 1, -1, -1):
+                    line_chars.insert(item["start_index"] + idx + 1, "\u0333")
+            formatted_lines.append(f"{line_no:3d}   {''.join(line_chars)}")
+
+        return "\n".join(formatted_lines)
+
+
+ENV_VAR_PATTERN = re.compile(r"\$\{([^}:\s]+)(?::-(.*?))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)")
+
+
+def _strip_matching_quotes(value: str) -> Tuple[str, int]:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1], 1
+    return value, 0
+
+
+def _parse_env_file(env_file: str) -> Tuple[List[EnvFileEntry], List[str]]:
+    entries: List[EnvFileEntry] = []
+    with open(env_file) as f:
+        template_lines = f.read().splitlines(keepends=False)
+
+    for line_no, raw_line in enumerate(template_lines, start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        key_part, separator, value_part = raw_line.partition("=")
+        if not separator:
+            continue
+
+        key = key_part.strip()
+        leading_ws = len(value_part) - len(value_part.lstrip())
+        value_start_index = len(key_part) + 1 + leading_ws
+        value, value_inner_offset = _strip_matching_quotes(value_part.strip())
+        entries.append(
+            EnvFileEntry(
+                key=key,
+                value=value,
+                line_no=line_no,
+                line_content=raw_line,
+                value_start_index=value_start_index,
+                value_inner_offset=value_inner_offset,
+            )
+        )
+    return entries, template_lines
+
+
+def _extract_refs(value: str) -> List[Tuple[str, int]]:
+    refs = []
+    for match in ENV_VAR_PATTERN.finditer(value):
+        var = match.group(1) if match.group(1) is not None else match.group(3)
+        start = match.start(1) if match.group(1) is not None else match.start(3)
+        refs.append((var, start))
+    return refs
+
+
+def _map_substitution_error(entry: EnvFileEntry, err: SubstitutionError) -> List[LineCheckResult]:
+    mapped_results = []
+    for result in err.results:
+        mapped_results.append(
+            LineCheckResult(
+                line_no=entry.line_no,
+                line_content=entry.line_content,
+                variable_name=result.variable_name,
+                start_index=entry.value_start_index + entry.value_inner_offset + (result.start_index or 0),
+            )
+        )
+    return mapped_results
+
+
+def _resolve_env_entries(entries: List[EnvFileEntry], env_file: str, base_env: Optional[Dict[str, str]] = None, max_cycles: int = 5) -> Dict[str, str]:
+    base_env = dict(base_env or os.environ)
+    current_values = {entry.key: entry.value for entry in entries}
+    local_keys = set(current_values.keys())
+    resolution_passes = max(max_cycles, len(entries))
+
+    for _ in range(resolution_passes):
+        next_values: Dict[str, str] = {}
+        missing_results: List[LineCheckResult] = []
+        changed = False
+
+        resolution_env = {**base_env, **current_values}
+        for entry in entries:
+            try:
+                resolved = envsubst(entry.value, env=resolution_env, on_error="throw")
+            except SubstitutionError as err:
+                missing_results.extend(_map_substitution_error(entry, err))
+                continue
+
+            next_values[entry.key] = resolved
+            if resolved != current_values[entry.key]:
+                changed = True
+
+        if missing_results:
+            missing_results.sort(key=lambda x: (x.line_no, x.start_index or 0))
+            raise EnvFileResolutionError(env_file, "Missing environment variables", missing_results, [])
+
+        current_values = next_values
+        if not changed:
+            break
+
+    cyclic_results: List[LineCheckResult] = []
+    for entry in entries:
+        final_value = current_values[entry.key]
+        for var_name, start_index in _extract_refs(final_value):
+            if var_name in local_keys:
+                original_refs = [(name, idx) for name, idx in _extract_refs(entry.value) if name in local_keys]
+                ref_positions = original_refs or [(var_name, 0)]
+                for original_name, original_index in ref_positions:
+                    cyclic_results.append(
+                        LineCheckResult(
+                            line_no=entry.line_no,
+                            line_content=entry.line_content,
+                            variable_name=original_name,
+                            start_index=entry.value_start_index + entry.value_inner_offset + original_index,
+                        )
+                    )
+                break
+
+    if cyclic_results:
+        deduped = {
+            (result.line_no, result.variable_name, result.start_index): result for result in cyclic_results
+        }
+        ordered_results = sorted(deduped.values(), key=lambda x: (x.line_no, x.start_index or 0))
+        raise EnvFileResolutionError(
+            env_file,
+            f"Cyclic environment variable references detected after {resolution_passes} resolution passes",
+            ordered_results,
+            [],
+        )
+
+    return current_values
+
+
+def load_env_file(env_file: str, base_env: Optional[Dict[str, str]] = None, max_cycles: int = 5) -> Dict[str, str]:
+    entries, _ = _parse_env_file(env_file)
+    return _resolve_env_entries(entries, env_file, base_env=base_env, max_cycles=max_cycles)
 
 
 class Docker:
     def __init__(self, registries: List[str] = []):
         self.stack = DockerStack(self)
+        self.node = DockerNode()
         self.config = DockerConfig()
         self.secret = DockerSecret()
         self.registry = DockerRegistry(registries)
@@ -25,12 +198,7 @@ class Docker:
     @staticmethod
     def load_env(env_file=".env"):
         if Path(env_file).is_file():
-            with open(env_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        key, _, value = line.partition("=")
-                        os.environ[key.strip()] = value.strip()
+            os.environ.update(load_env_file(env_file))
 
     @staticmethod
     def check_env(example_file=".env.example"):
@@ -113,11 +281,19 @@ class DockerStack:
         """
         processed_objects = {}
 
-        def add_obj(name, data, is_generated_secret=False):
+        def add_obj(name, data, explicit_name=None, is_generated_secret=False):
             labels = []
             if is_generated_secret:
                 labels.append("mesudip.secret.generated=true")
-            (object_name, command) = manager.create(name, data, labels=labels, stack=stack)
+
+            if explicit_name:
+                docker_object_name = explicit_name
+            elif stack:
+                docker_object_name = f"{stack}_{name}"
+            else:
+                docker_object_name = name
+
+            (object_name, command) = manager.create(docker_object_name, data, labels=labels, stack=stack)
             if not command.isNop():
                 self.commands.append(command)
                 # If a new secret was actually created (not just reused), store it
@@ -126,17 +302,18 @@ class DockerStack:
             processed_objects[name] = {"name": object_name, "external": True}
 
         for name, details in objects.items():
+            explicit_name = details.get("name") if isinstance(details, dict) else None
             if isinstance(details, dict) and "x-content" in details:
-                add_obj(name, details["x-content"])
+                add_obj(name, details["x-content"], explicit_name=explicit_name)
             elif isinstance(details, dict) and "x-template" in details:
-                add_obj(name, envsubst(details["x-content"], os.environ))
+                add_obj(name, envsubst(details["x-content"], os.environ), explicit_name=explicit_name)
             elif isinstance(details, dict) and "x-template-file" in details:
                 filename = os.path.join(base_dir, details["x-template-file"])
-                add_obj(name, envsubst_load_file(filename, os.environ))
+                add_obj(name, envsubst_load_file(filename, os.environ), explicit_name=explicit_name)
             elif isinstance(details, dict) and "file" in details:
                 filename = os.path.join(base_dir, details["file"])
                 with open(filename) as file:
-                    add_obj(name, file.read())
+                    add_obj(name, file.read(), explicit_name=explicit_name)
             elif isinstance(details, dict) and "x-generate" in details and manager.object_type == "secret":
                 is_generated_secret = True
                 generate_options = details["x-generate"]
@@ -159,7 +336,7 @@ class DockerStack:
                     raise ValueError(f"Invalid x-generate value for secret {name}: {generate_options}")
 
                 # Call add_obj with the potentially new secret content and the generated flag
-                add_obj(name, secret_content, is_generated_secret=True)
+                add_obj(name, secret_content, explicit_name=explicit_name, is_generated_secret=True)
             else:
                 processed_objects[name] = details
         return processed_objects
@@ -359,6 +536,11 @@ class DockerStack:
 
                 build_command = ["docker", "build", "-t", image]
 
+                dockerfile = build_config.get("dockerfile")
+                context_path = os.path.normpath(os.path.join(base_dir, build_config.get("context", ".")))
+                if dockerfile:
+                    build_command.extend(["-f", os.path.normpath(os.path.join(context_path, dockerfile))])
+
                 args = build_config.get("args", [])
 
                 if isinstance(args, dict):
@@ -368,7 +550,7 @@ class DockerStack:
                     for value in args:
                         build_command.extend(["--build-arg", envsubst(value)])
 
-                build_command.append(os.path.join(base_dir, build_config.get("context", ".")))
+                build_command.append(context_path)
                 self.commands.append(Command(build_command))
 
                 if push:
@@ -386,6 +568,72 @@ class DockerStack:
             cmd = self.docker.registry.push(image_name)
             if cmd:
                 self.commands.append(cmd)
+
+
+class DockerNode:
+    @staticmethod
+    def _format_labels(labels: Dict[str, str]) -> str:
+        if not labels:
+            return "-"
+        parts = []
+        for key, value in sorted(labels.items()):
+            parts.append(key if value == "true" else f"{key}={value}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def ls():
+        nodes_output = subprocess.check_output(["docker", "node", "ls", "--format", "{{json .}}"], text=True).strip()
+        rows = []
+
+        for line in nodes_output.splitlines():
+            if not line:
+                continue
+            node = json.loads(line)
+            inspect = json.loads(
+                subprocess.check_output(["docker", "node", "inspect", node["ID"], "--format", "{{json .}}"], text=True).strip()
+            )
+            labels = inspect.get("Spec", {}).get("Labels", {})
+            manager_status = node.get("ManagerStatus", "").strip()
+            role = inspect.get("Spec", {}).get("Role", "-")
+            role_display = f"{role} ({manager_status})" if manager_status else role
+            rows.append(
+                {
+                    "hostname": node.get("Hostname", "-"),
+                    "role": role_display,
+                    "state": f"{node.get('Status', '-')} / {node.get('Availability', '-')}",
+                    "address": inspect.get("Status", {}).get("Addr", "-"),
+                    "labels": DockerNode._format_labels(labels),
+                }
+            )
+
+        columns = [
+            ("Hostname", "hostname"),
+            ("Role", "role"),
+            ("State", "state"),
+            ("Address", "address"),
+        ]
+
+        widths = {
+            key: max(len(title), max((len(str(row[key])) for row in rows), default=0))
+            for title, key in columns
+        }
+        terminal_width = shutil.get_terminal_size((120, 20)).columns
+        static_width = sum(widths.values()) + (3 * (len(columns) - 1))
+        label_width = max(24, min(60, terminal_width - static_width - 3 - len("Labels")))
+
+        header = " | ".join(title.ljust(widths[key]) for title, key in columns) + " | Labels"
+        separator = "-+-".join("-" * widths[key] for _, key in columns) + "-+-" + ("-" * label_width)
+        print(header)
+        print(separator)
+        for row in rows:
+            wrapped_labels = textwrap.wrap(row["labels"], width=label_width, break_long_words=False, break_on_hyphens=False) or ["-"]
+            first_line = " | ".join(str(row[key]).ljust(widths[key]) for _, key in columns)
+            print(f"{first_line} | {wrapped_labels[0]}")
+            continuation_prefix = " | ".join("".ljust(widths[key]) for _, key in columns)
+            for label_line in wrapped_labels[1:]:
+                print(f"{continuation_prefix} | {label_line}")
+
+        return rows
 
 
 def main(args: List[str] = None):
@@ -418,6 +666,10 @@ def main(args: List[str] = None):
 
     # Ls command
     subparsers.add_parser("ls", help="List docker-stacks")
+
+    node_parser = subparsers.add_parser("node", help="Inspect Docker Swarm nodes")
+    node_subparsers = node_parser.add_subparsers(dest="node_command", required=True)
+    node_subparsers.add_parser("ls", help="List Docker Swarm nodes and their labels")
 
     cat_parser = subparsers.add_parser(
         "cat", help="Print the docker compose of specific version. Defaults to latest version if not specified."
@@ -458,6 +710,9 @@ def main(args: List[str] = None):
         docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth, tag=args.tag, show_generated=args.show_generated)
     elif args.command == "ls":
         docker.stack.ls()
+    elif args.command == "node":
+        if args.node_command == "ls":
+            docker.node.ls()
 
     elif args.command == "rm":
         docker.stack.rm(args.stack_name)

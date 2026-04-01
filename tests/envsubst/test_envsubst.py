@@ -26,6 +26,12 @@ def test_substitution_with_default_value_and_env_set():
     assert envsubst(template, env=env) == "This is actual world."
 
 
+def test_substitution_with_default_value_and_env_empty():
+    env = {"MY_VAR": ""}
+    template = "This is ${MY_VAR:-default} world."
+    assert envsubst(template, env=env) == "This is default world."
+
+
 def test_multiple_substitutions():
     env = {"VAR1": "value1", "VAR2": "value2"}
     template = "${VAR1} and ${VAR2}."
@@ -59,7 +65,21 @@ def test_empty_string():
 def test_variable_with_empty_value():
     env = {"EMPTY_VAR": ""}
     template = "Value: ${EMPTY_VAR}"
-    assert envsubst(template, env=env) == "Value: "
+
+    with pytest.raises(SubstitutionError) as excinfo:
+        envsubst(template, env=env, on_error="throw")
+
+    assert excinfo.value.results[0].variable_name == "EMPTY_VAR"
+
+
+def test_variable_without_braces_with_empty_value():
+    env = {"EMPTY_VAR": ""}
+    template = "Value: $EMPTY_VAR"
+
+    with pytest.raises(SubstitutionError) as excinfo:
+        envsubst(template, env=env, on_error="throw")
+
+    assert excinfo.value.results[0].variable_name == "EMPTY_VAR"
 
 
 def test_variable_with_empty_default():
