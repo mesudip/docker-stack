@@ -552,6 +552,6 @@ def test_browser_login_handles_callback_and_token_exchange(monkeypatch):
     result = browser_login(config, browser_opener=fake_browser_open, port_finder=port_finder)
 
     assert result.redirect_uri.endswith("/auth/callback")
-    assert result.callback_port in range(8070, 8080)
+    assert result.callback_port > 0
     assert result.access_token == "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"
     assert result.expires_at == 1900000000

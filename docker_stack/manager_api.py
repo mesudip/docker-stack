@@ -48,6 +48,28 @@ def _manager_target_from_env() -> Optional[str]:
     return None
 
 
+def _format_control_plane_endpoints(endpoints: Any) -> str:
+    if not isinstance(endpoints, list) or not endpoints:
+        return "none"
+    values = []
+    for item in endpoints:
+        if not isinstance(item, dict):
+            continue
+        endpoint_id = item.get("id")
+        name = str(item.get("name") or "").strip()
+        slug = str(item.get("slug") or "").strip()
+        parts = []
+        if endpoint_id is not None:
+            parts.append(f"id={endpoint_id}")
+        if name:
+            parts.append(f"name={name}")
+        if slug:
+            parts.append(f"slug={slug}")
+        if parts:
+            values.append(", ".join(parts))
+    return "; ".join(values) if values else "none"
+
+
 class ManagerApiClient:
     def __init__(
         self,
@@ -134,70 +156,13 @@ class ManagerApiClient:
 
         self._endpoint_id_checked = True
 
-        env_endpoint_id = os.getenv("DOCKER_MANAGER_ENDPOINT_ID", "").strip()
-        if env_endpoint_id:
-            try:
-                parsed_id = int(env_endpoint_id)
-            except ValueError as exc:
-                raise RuntimeError("DOCKER_MANAGER_ENDPOINT_ID must be a positive integer") from exc
-            if parsed_id <= 0:
-                raise RuntimeError("DOCKER_MANAGER_ENDPOINT_ID must be a positive integer")
-            self._endpoint_id = parsed_id
-            return parsed_id
-
         payload = self._request_json("/api/endpoints")
         endpoints = payload.get("endpoints")
-        if not isinstance(endpoints, list) or not endpoints:
-            raise RuntimeError("No visible Docker-Manager endpoints available")
-
-        endpoint_slug = os.getenv("DOCKER_MANAGER_ENDPOINT_SLUG", "").strip()
-        endpoint_name = os.getenv("DOCKER_MANAGER_ENDPOINT_NAME", "").strip()
-        selected = None
-
-        if endpoint_slug:
-            selected = next(
-                (
-                    item
-                    for item in endpoints
-                    if isinstance(item, dict) and str(item.get("slug", "")).strip() == endpoint_slug
-                ),
-                None,
-            )
-            if selected is None:
-                raise RuntimeError(
-                    f"Could not find endpoint with slug '{endpoint_slug}'. "
-                    "Set DOCKER_MANAGER_ENDPOINT_ID to select explicitly."
-                )
-        elif endpoint_name:
-            selected = next(
-                (
-                    item
-                    for item in endpoints
-                    if isinstance(item, dict) and str(item.get("name", "")).strip() == endpoint_name
-                ),
-                None,
-            )
-            if selected is None:
-                raise RuntimeError(
-                    f"Could not find endpoint with name '{endpoint_name}'. "
-                    "Set DOCKER_MANAGER_ENDPOINT_ID to select explicitly."
-                )
-        else:
-            selected = next((item for item in endpoints if isinstance(item, dict)), None)
-
-        if not isinstance(selected, dict):
-            raise RuntimeError("Docker-Manager endpoint payload is invalid")
-
-        try:
-            endpoint_id = int(selected.get("id"))
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Docker-Manager endpoint payload is missing a valid id") from exc
-
-        if endpoint_id <= 0:
-            raise RuntimeError("Docker-Manager endpoint id must be positive")
-
-        self._endpoint_id = endpoint_id
-        return endpoint_id
+        raise RuntimeError(
+            "docker-stack does not support Docker-Manager control-plane targets. "
+            "Point DOCKER_MANAGER_URL at a direct manager stack API instead. "
+            f"Visible endpoints: {_format_control_plane_endpoints(endpoints)}"
+        )
 
     def _endpoint_path(self, suffix: str) -> str:
         normalized = suffix if suffix.startswith("/") else f"/{suffix}"
@@ -208,12 +173,8 @@ class ManagerApiClient:
         features = self.detect_features()
         if feature_name not in features:
             return False
-        if feature_name in {FEATURE_STACK_QUERY, FEATURE_STACK_DEPLOY}:
+        if feature_name == FEATURE_STACK_DEPLOY:
             if not self._detect_manager_backend():
-                return False
-            try:
-                self._resolve_endpoint_id()
-            except RuntimeError:
                 return False
         return True
 
@@ -300,7 +261,7 @@ class ManagerApiClient:
         if options:
             payload["options"] = options
         return self._request_json(
-            self._endpoint_path("/stacks/validate"),
+            "/api/stacks/validate",
             method="POST",
             payload=payload,
         )
@@ -317,7 +278,7 @@ class ManagerApiClient:
         if options:
             payload["options"] = options
         return self._request_json(
-            self._endpoint_path("/stacks/deploy"),
+            "/api/stacks/deploy",
             method="POST",
             payload=payload,
         )
