@@ -28,7 +28,7 @@ def test_node_ls_prints_nodes_and_labels(monkeypatch, capsys):
         },
     }
 
-    def fake_check_output(command, text=True):
+    def fake_run_cli_command(command, **kwargs):
         if command[:3] == ["docker", "node", "ls"]:
             return "\n".join(
                 [
@@ -56,8 +56,9 @@ def test_node_ls_prints_nodes_and_labels(monkeypatch, capsys):
             return json.dumps(inspect_payloads[command[3]])
         raise AssertionError(f"Unexpected command: {command}")
 
-    monkeypatch.setattr("docker_stack.cli.subprocess.check_output", fake_check_output)
-    monkeypatch.setattr("docker_stack.cli.shutil.get_terminal_size", lambda fallback: os.terminal_size((72, 20)))
+    monkeypatch.setattr("docker_stack.cli.run_cli_command", fake_run_cli_command)
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("docker_stack.cli.shutil.get_terminal_size", lambda *args, **kwargs: os.terminal_size((72, 20)))
 
     main(["node", "ls"])
 

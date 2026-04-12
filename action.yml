@@ -1,0 +1,157 @@
+name: Setup docker-stack auth
+description: Configure isolated Docker auth/context for docker-stack and Docker CLI commands in GitHub Actions.
+
+inputs:
+  manager:
+    description: Docker-Manager host, IP, or URL.
+    required: true
+  context:
+    description: Optional Docker context name. Defaults to docker-stack's inferred context.
+    required: false
+    default: ""
+  auth-mode:
+    description: Optional auth mode. One of auto, oidc, access-token.
+    required: false
+    default: auto
+  access-token:
+    description: Optional pre-issued manager access token.
+    required: false
+    default: ""
+  oidc-audience:
+    description: Audience to request for GitHub OIDC tokens.
+    required: false
+    default: docker-manager
+  docker-config-dir:
+    description: Optional isolated Docker config directory. Defaults to RUNNER_TEMP/docker-stack/<context-or-default> or ~/.docker-stack/actions/<context-or-default>.
+    required: false
+    default: ""
+  verify-ssl:
+    description: Verify the manager TLS certificate. Defaults to false.
+    required: false
+    default: "false"
+
+outputs:
+  docker-config:
+    description: Docker config directory configured by the action.
+    value: ${{ steps.setup.outputs.docker-config }}
+  docker-context:
+    description: Docker context selected by the action.
+    value: ${{ steps.setup.outputs.docker-context }}
+  manager-url:
+    description: Normalized Docker-Manager URL.
+    value: ${{ steps.setup.outputs.manager-url }}
+  skip-tls-verify:
+    description: Whether TLS verification is skipped for the manager endpoint.
+    value: ${{ steps.setup.outputs.skip-tls-verify }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+
+    - name: Install docker-stack
+      shell: bash
+      run: python3 -m pip install --upgrade "$GITHUB_ACTION_PATH"
+
+    - name: Setup auth
+      id: setup
+      shell: bash
+      env:
+        INPUT_MANAGER: ${{ inputs.manager }}
+        INPUT_CONTEXT: ${{ inputs.context }}
+        INPUT_AUTH_MODE: ${{ inputs.auth-mode }}
+        INPUT_ACCESS_TOKEN: ${{ inputs.access-token }}
+        INPUT_OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
+        INPUT_DOCKER_CONFIG_DIR: ${{ inputs.docker-config-dir }}
+        INPUT_VERIFY_SSL: ${{ inputs.verify-ssl }}
+      run: |
+        set -euo pipefail
+
+        auth_mode="${INPUT_AUTH_MODE:-auto}"
+        context_name="${INPUT_CONTEXT:-}"
+        if [ -z "$context_name" ]; then
+          context_name="dm-proxy"
+        fi
+
+        docker_config_dir="${INPUT_DOCKER_CONFIG_DIR:-}"
+        if [ -z "$docker_config_dir" ]; then
+          runner_temp="${RUNNER_TEMP:-}"
+          if [ -n "$runner_temp" ]; then
+            docker_config_dir="${runner_temp%/}/docker-stack/${context_name}"
+          else
+            docker_config_dir="$HOME/.docker-stack/actions/${context_name}"
+          fi
+        fi
+
+        access_token="${INPUT_ACCESS_TOKEN:-}"
+        verify_ssl="${INPUT_VERIFY_SSL:-false}"
+        oidc_token=""
+
+        case "$auth_mode" in
+          auto)
+            if [ -n "$access_token" ]; then
+              auth_mode="access-token"
+            else
+              auth_mode="oidc"
+            fi
+            ;;
+          oidc|access-token)
+            ;;
+          *)
+            echo "Unsupported auth-mode: $auth_mode" >&2
+            exit 2
+            ;;
+        esac
+
+        cli_args=()
+        cli_args+=("$INPUT_MANAGER")
+        if [ -n "${INPUT_CONTEXT:-}" ]; then
+          cli_args+=("--context" "$INPUT_CONTEXT")
+        fi
+        cli_args+=("--docker-config-dir" "$docker_config_dir")
+        if [ "$verify_ssl" = "true" ]; then
+          cli_args+=("--verify-ssl")
+        fi
+
+        if [ "$auth_mode" = "oidc" ]; then
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC environment is unavailable. Ensure workflow permissions include id-token: write." >&2
+            exit 2
+          fi
+          response="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${INPUT_OIDC_AUDIENCE}")"
+          oidc_token="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
+          if [ -z "$oidc_token" ] || [ "$oidc_token" = "null" ]; then
+            echo "Failed to obtain GitHub OIDC token" >&2
+            exit 2
+          fi
+          output="$(docker-stack setup-auth "${cli_args[@]}" --github-oidc-token "$oidc_token")"
+        else
+          if [ -z "$access_token" ]; then
+            echo "access-token auth mode requires access-token input" >&2
+            exit 2
+          fi
+          output="$(docker-stack setup-auth "${cli_args[@]}" --access-token "$access_token")"
+        fi
+
+        printf '%s\n' "$output"
+
+        docker_config="$(printf '%s\n' "$output" | sed -n 's/^DOCKER_CONFIG=//p' | tail -n1)"
+        docker_context="$(printf '%s\n' "$output" | sed -n 's/^DOCKER_CONTEXT=//p' | tail -n1)"
+        manager_url="$(printf '%s\n' "$output" | sed -n 's/^MANAGER_URL=//p' | tail -n1)"
+        skip_tls_verify="$(printf '%s\n' "$output" | sed -n 's/^SKIP_TLS_VERIFY=//p' | tail -n1)"
+
+        {
+          echo "DOCKER_CONFIG=$docker_config"
+          echo "DOCKER_CONTEXT=$docker_context"
+          echo "DOCKER_MANAGER_URL=$manager_url"
+        } >> "$GITHUB_ENV"
+
+        {
+          echo "docker-config=$docker_config"
+          echo "docker-context=$docker_context"
+          echo "manager-url=$manager_url"
+          echo "skip-tls-verify=$skip_tls_verify"
+        } >> "$GITHUB_OUTPUT"

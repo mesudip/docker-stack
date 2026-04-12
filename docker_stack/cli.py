@@ -2,9 +2,9 @@
 import argparse
 import base64
 from dataclasses import dataclass
+import subprocess
 import re
 import shutil
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -13,7 +13,22 @@ import os
 import yaml
 import json
 from docker_stack.docker_objects import DockerConfig, DockerObjectManager, DockerSecret
-from docker_stack.helpers import Command, generate_secret
+from docker_stack.helpers import CallbackCommand, Command, generate_secret, run_cli_command
+from docker_stack.login import (
+    ensure_isolated_login,
+    format_expiry,
+    login as docker_manager_login,
+    resolve_login_config,
+    resolve_shell_login_config,
+    setup_auth as docker_manager_setup_auth,
+    switch_docker_context,
+)
+from docker_stack.manager_api import (
+    FEATURE_STACK_DEPLOY,
+    FEATURE_STACK_QUERY,
+    ManagerApiClient,
+    discover_manager_client,
+)
 from docker_stack.registry import DockerRegistry
 from .envsubst import LineCheckResult, SubstitutionError, envsubst, envsubst_load_file
 
@@ -190,10 +205,18 @@ def load_env_file(env_file: str, base_env: Optional[Dict[str, str]] = None, max_
 class Docker:
     def __init__(self, registries: List[str] = []):
         self.stack = DockerStack(self)
-        self.node = DockerNode()
+        self.node = DockerNode(self)
         self.config = DockerConfig()
         self.secret = DockerSecret()
         self.registry = DockerRegistry(registries)
+        self._manager_client_checked = False
+        self._manager_client: Optional[ManagerApiClient] = None
+
+    def manager_client(self) -> Optional[ManagerApiClient]:
+        if not self._manager_client_checked:
+            self._manager_client = discover_manager_client()
+            self._manager_client_checked = True
+        return self._manager_client
 
     @staticmethod
     def load_env(env_file=".env"):
@@ -341,10 +364,76 @@ class DockerStack:
                 processed_objects[name] = details
         return processed_objects
 
+    def _manager_client_for_feature(self, feature_name: str) -> Optional[ManagerApiClient]:
+        client = self.docker.manager_client()
+        if not client:
+            return None
+        try:
+            if client.supports(feature_name):
+                return client
+        except RuntimeError:
+            return None
+        return None
+
+    @staticmethod
+    def _normalize_version(value: str) -> str:
+        if value.startswith("v") or value.startswith("V"):
+            return value[1:]
+        return value
+
+    @staticmethod
+    def _version_sort_key(raw: str):
+        return int(raw) if raw.isdigit() else raw
+
+    def _print_stack_listing(self, stack_versions: Dict[str, List[str]]) -> None:
+        max_stack_name_length = max(len(stack) for stack in stack_versions) if stack_versions else 10
+        header_stack = "Stack Name".ljust(max_stack_name_length)
+
+        print(f"{header_stack} | Versions")
+        print("-" * (max_stack_name_length + 12))
+
+        for stack, versions in sorted(stack_versions.items()):
+            versions_str = ", ".join(sorted(versions, key=self._version_sort_key))
+            print(f"{stack.ljust(max_stack_name_length)} | {versions_str}")
+
+    def _print_versions(self, versions_list: List[Tuple[str, str]]) -> None:
+        rows = [("Version", "Tag")] + versions_list
+        max_version_length = max(len(v[0]) for v in rows)
+        max_tag_length = max(len(v[1]) for v in rows)
+
+        print(f"{'Version'.ljust(max_version_length)} | {'Tag'.ljust(max_tag_length)}")
+        print("-" * (max_version_length + max_tag_length + 3))
+
+        for version, tag in sorted(versions_list, key=lambda x: self._version_sort_key(x[0])):
+            print(f"{version.ljust(max_version_length)} | {tag.ljust(max_tag_length)}")
+
     def ls(self):
+        client = self._manager_client_for_feature(FEATURE_STACK_QUERY)
+        if client:
+            try:
+                payload = client.list_stacks()
+                stack_versions = {
+                    str(item.get("stack")): [
+                        str(version)
+                        for version in (
+                            item.get("versions")
+                            if isinstance(item.get("versions"), list)
+                            else item.get("available_versions", [])
+                        )
+                        if str(version).strip()
+                    ]
+                    for item in payload.get("stacks", [])
+                    if str(item.get("stack", "")).strip()
+                }
+                self._print_stack_listing(stack_versions)
+                return stack_versions
+            except RuntimeError:
+                pass
+
         cmd = ["docker", "config", "ls", "--format", "{{.ID}}\t{{.Name}}\t{{.Labels}}"]
-        output = subprocess.check_output(cmd, text=True).strip().split("\n")
-        stack_versions = {}
+        raw_output = run_cli_command(cmd, log=False)
+        output = raw_output.split("\n") if raw_output else []
+        stack_versions: Dict[str, List[str]] = {}
 
         for line in output:
             parts = line.split("\t")
@@ -354,52 +443,67 @@ class DockerStack:
                 version = labels.get("mesudip.object.version", "unknown")
 
                 if stack_name:
-                    if stack_name not in stack_versions:
-                        stack_versions[stack_name] = []
-                    stack_versions[stack_name].append(version)
+                    stack_versions.setdefault(stack_name, []).append(version)
 
-        # Calculate max stack name width
-        max_stack_name_length = max(len(stack) for stack in stack_versions) if stack_versions else 10
-        header_stack = "Stack Name".ljust(max_stack_name_length)
-
-        print(f"{header_stack} | Versions")
-        print("-" * (max_stack_name_length + 12))
-
-        for stack, versions in sorted(stack_versions.items()):
-            versions_str = ", ".join(sorted(versions, key=int))
-            print(f"{stack.ljust(max_stack_name_length)} | {versions_str}")
-
+        self._print_stack_listing(stack_versions)
         return stack_versions
 
-    def cat(self, name: str, version: str):
-        if version.startswith("v") or version.startswith("V"):
-            version = version[1:]
-        if version == "1":
-            name = f"{name}"
+    def cat(self, name: str, version: str, namespace: str = "default"):
+        normalized_version = self._normalize_version(version)
+        client = self._manager_client_for_feature(FEATURE_STACK_QUERY)
+        if client:
+            try:
+                payload = client.get_stack_compose(
+                    name,
+                    namespace=namespace,
+                    version=normalized_version,
+                )
+                compose = payload.get("compose")
+                if isinstance(compose, str):
+                    return compose
+            except RuntimeError:
+                pass
+
+        if normalized_version == "1":
+            config_name = f"{name}"
         else:
-            name = f"{name}_v{version}"
+            config_name = f"{name}_v{normalized_version}"
 
-        cmd = ["docker", "config", "inspect", name]
-        output = subprocess.check_output(cmd, text=True).strip()
+        cmd = ["docker", "config", "inspect", config_name]
+        output = run_cli_command(cmd, log=False)
 
-        # Parse the JSON output
         configs = json.loads(output)
         if not configs:
-            print(f"No config found for {name}")
+            print(f"No config found for {config_name}")
             return None
 
-        # Extract and decode the base64-encoded Spec.Data
         encoded_data = configs[0].get("Spec", {}).get("Data", "")
         if not encoded_data:
-            print(f"No data found in config {name}")
+            print(f"No data found in config {config_name}")
             return None
 
         decoded_data = base64.b64decode(encoded_data).decode("utf-8")
         return decoded_data
 
-    def versions(self, stack_name):
+    def versions(self, stack_name, namespace: str = "default", print_output: bool = True):
+        client = self._manager_client_for_feature(FEATURE_STACK_QUERY)
+        if client:
+            try:
+                payload = client.list_stack_versions(stack_name, namespace=namespace)
+                versions_list = [
+                    (str(item.get("version", "")), str(item.get("tag", "")))
+                    for item in payload.get("versions", [])
+                    if str(item.get("version", "")).strip()
+                ]
+                if print_output:
+                    self._print_versions(versions_list)
+                return versions_list
+            except RuntimeError:
+                pass
+
         cmd = ["docker", "config", "ls", "--format", "{{.Name}}\t{{.Labels}}"]
-        output = subprocess.check_output(cmd, text=True).strip().split("\n")
+        raw_output = run_cli_command(cmd, log=False)
+        output = raw_output.split("\n") if raw_output else []
         versions_list = []
 
         for line in output:
@@ -413,24 +517,11 @@ class DockerStack:
                 if stack == stack_name:
                     versions_list.append((version, tag))
 
-        # Add headers to list for proper spacing calculation
-        versions_list.insert(0, ("Version", "Tag"))
+        if print_output:
+            self._print_versions(versions_list)
+        return versions_list
 
-        # Determine max column widths
-        max_version_length = max(len(v[0]) for v in versions_list)
-        max_tag_length = max(len(v[1]) for v in versions_list)
-
-        # Print header
-        print(f"{'Version'.ljust(max_version_length)} | {'Tag'.ljust(max_tag_length)}")
-        print("-" * (max_version_length + max_tag_length + 3))
-
-        # Print sorted versions (excluding header)
-        for version, tag in sorted(versions_list[1:], key=lambda x: int(x[0]) if x[0].isdigit() else x[0]):
-            print(f"{version.ljust(max_version_length)} | {tag.ljust(max_tag_length)}")
-
-        return versions_list[1:]
-
-    def checkout(self, stack_name, identifier, with_registry_auth=False):
+    def checkout(self, stack_name, identifier, with_registry_auth=False, namespace: str = "default", dry_run: bool = False):
         """
         Deploys a stack by version or tag.
 
@@ -439,57 +530,235 @@ class DockerStack:
         :param with_registry_auth: Whether to use registry authentication.
         """
 
-        # Regex to check if the identifier is a version (optional "v" or "V" at the start, followed by digits)
         version_pattern = re.compile(r"^[vV]?(\d+(\.\d+)*)$")
+        manager_query = self._manager_client_for_feature(FEATURE_STACK_QUERY)
+        manager_deploy = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
 
         match = version_pattern.match(identifier)
         if match:
-            version = match.group(1)  # Extract the numeric version part
+            version = match.group(1)
             tag = None
         else:
             tag = identifier
-            versions_list = self.versions(stack_name)
-            matching_versions = [v for v, t in versions_list if t == tag]
-            if not matching_versions:
-                raise ValueError(f"No version found for tag '{tag}' in stack '{stack_name}'")
-            version = matching_versions[0]  # Use the first matching version
+            version = None
 
-        compose_content = self.cat(stack_name, version)
+        if manager_deploy and not with_registry_auth:
+            rollback_version = version
+            if not rollback_version and tag:
+                try:
+                    versions_payload = manager_query.list_stack_versions(stack_name, namespace=namespace) if manager_query else {}
+                except RuntimeError:
+                    versions_payload = {}
+                for item in versions_payload.get("versions", []):
+                    if str(item.get("tag", "")) == tag:
+                        rollback_version = str(item.get("version", ""))
+                        break
+
+            if rollback_version:
+                if dry_run:
+                    print(f"[manager] rollback dry-run target: {stack_name} v{rollback_version} ({namespace})")
+                    return
+                self.commands.append(
+                    CallbackCommand(
+                        f"docker-manager stack rollback {stack_name} v{rollback_version}",
+                        lambda v=rollback_version: self._rollback_via_manager(
+                            manager_deploy,
+                            stack_name=stack_name,
+                            namespace=namespace,
+                            version=v,
+                        ),
+                    )
+                )
+                return
+
+        compose_content = None
+        if manager_query:
+            try:
+                payload = manager_query.get_stack_compose(
+                    stack_name,
+                    namespace=namespace,
+                    version=version if version else None,
+                    tag=tag,
+                )
+                compose_content = payload.get("compose")
+                resolved = payload.get("version")
+                if isinstance(resolved, str) and resolved.strip():
+                    version = resolved
+            except RuntimeError:
+                compose_content = None
+
+        if compose_content is None:
+            if not version:
+                versions_list = self.versions(stack_name, namespace=namespace, print_output=False)
+                matching_versions = [v for v, t in versions_list if t == tag]
+                if not matching_versions:
+                    raise ValueError(f"No version found for tag '{tag}' in stack '{stack_name}'")
+                version = matching_versions[0]
+            compose_content = self.cat(stack_name, version, namespace=namespace)
 
         temp_file = f"/tmp/{stack_name}_v{version}.yml"
         with open(temp_file, "w") as f:
             f.write(compose_content)
 
         print(f"Deploying stack {stack_name} with version {version} (tag: {tag})...")
-        self._deploy(stack_name, temp_file, compose_content, with_registry_auth=with_registry_auth, tag=tag)
+        self._deploy(
+            stack_name,
+            temp_file,
+            compose_content,
+            with_registry_auth=with_registry_auth,
+            tag=tag,
+            namespace=namespace,
+            dry_run=dry_run,
+        )
 
-    def _deploy(self, stack_name, rendered_filename, rendered_content, with_registry_auth=False, tag=None):
-        labels = [f"mesudip.stack.name={stack_name}"]
+    def _deploy(
+        self,
+        stack_name,
+        rendered_filename,
+        rendered_content,
+        with_registry_auth=False,
+        tag=None,
+        namespace: str = "default",
+        dry_run: bool = False,
+    ):
+        labels = [
+            f"mesudip.stack.name={stack_name}",
+            f"com.mesudip.namespace={namespace}",
+            f"com.mesudip.stack={stack_name}",
+        ]
         if tag:
             labels.append(f"mesudip.stack.tag={tag}")
+
+        manager_deploy = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
+        if manager_deploy and not with_registry_auth and dry_run:
+            self._validate_via_manager(
+                manager_deploy,
+                stack_name=stack_name,
+                namespace=namespace,
+                rendered_content=rendered_content,
+            )
+            return
 
         _, cmd = self.docker.config.increment(stack_name, rendered_content, labels=labels, stack=stack_name)
         if not cmd.isNop():
             self.commands.append(cmd)
+
+        if manager_deploy and not with_registry_auth:
+            self.commands.append(
+                CallbackCommand(
+                    f"docker-manager stack deploy {stack_name}",
+                    lambda: self._deploy_via_manager(
+                        manager_deploy,
+                        stack_name=stack_name,
+                        namespace=namespace,
+                        rendered_content=rendered_content,
+                    ),
+                )
+            )
+            return
+
         cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
         if with_registry_auth:
             cmd.insert(3, "--with-registry-auth")
         self.commands.append(Command(cmd, give_console=True))
 
-    def deploy(self, stack_name, compose_file, with_registry_auth=False, tag=None, show_generated=True):
+    @staticmethod
+    def _validate_via_manager(
+        manager_client: ManagerApiClient,
+        *,
+        stack_name: str,
+        namespace: str,
+        rendered_content: str,
+    ) -> Optional[str]:
+        payload = manager_client.validate_stack(
+            stack=stack_name,
+            namespace=namespace,
+            compose=rendered_content,
+            options={},
+        )
+        warnings = payload.get("warnings") or []
+        for warning in warnings:
+            print(f"[manager] {warning}")
+        summary = payload.get("summary") or {}
+        service_count = summary.get("service_count", 0)
+        config_count = summary.get("config_count", 0)
+        secret_count = summary.get("secret_count", 0)
+        print(
+            "[manager] validation: "
+            f"services={service_count}, configs={config_count}, secrets={secret_count}"
+        )
+        return None
+
+    @staticmethod
+    def _deploy_via_manager(
+        manager_client: ManagerApiClient,
+        *,
+        stack_name: str,
+        namespace: str,
+        rendered_content: str,
+    ) -> Optional[str]:
+        payload = manager_client.deploy_stack(
+            stack=stack_name,
+            namespace=namespace,
+            compose=rendered_content,
+            options={},
+        )
+        warnings = payload.get("warnings") or []
+        for warning in warnings:
+            print(f"[manager] {warning}")
+        stdout = payload.get("stdout")
+        stderr = payload.get("stderr")
+        if isinstance(stdout, str) and stdout.strip():
+            print(stdout.rstrip())
+        if isinstance(stderr, str) and stderr.strip():
+            print(stderr.rstrip())
+        return None
+
+    @staticmethod
+    def _rollback_via_manager(
+        manager_client: ManagerApiClient,
+        *,
+        stack_name: str,
+        namespace: str,
+        version: str,
+    ) -> Optional[str]:
+        payload = manager_client.rollback_stack(
+            stack=stack_name,
+            namespace=namespace,
+            version=version,
+        )
+        warnings = payload.get("warnings") or []
+        for warning in warnings:
+            print(f"[manager] {warning}")
+        stdout = payload.get("stdout")
+        stderr = payload.get("stderr")
+        if isinstance(stdout, str) and stdout.strip():
+            print(stdout.rstrip())
+        if isinstance(stderr, str) and stderr.strip():
+            print(stderr.rstrip())
+        return None
+
+    def deploy(
+        self,
+        stack_name,
+        compose_file,
+        with_registry_auth=False,
+        tag=None,
+        show_generated=True,
+        namespace: str = "default",
+        dry_run: bool = False,
+    ):
         self.generated_secrets = {}  # Reset for each deployment
         rendered_filename, rendered_content = self.render_compose_file(compose_file, stack=stack_name, include_build=False)
-        labels = [f"mesudip.stack.name={stack_name}"]
-        if tag:
-            labels.append(f"mesudip.stack.tag={tag}")
-
-        _, cmd = self.docker.config.increment(stack_name, rendered_content, labels=labels, stack=stack_name)
-        if not cmd.isNop():
-            self.commands.append(cmd)
-        cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
-        if with_registry_auth:
-            cmd.insert(3, "--with-registry-auth")
-        self.commands.append(Command(cmd, give_console=True))
+        self._deploy(
+            stack_name,
+            rendered_filename,
+            rendered_content,
+            with_registry_auth=with_registry_auth,
+            tag=tag,
+            namespace=namespace,
+            dry_run=dry_run,
+        )
 
         if show_generated and self.generated_secrets:
             print("\n----- Newly Generated Secrets -----")
@@ -505,6 +774,9 @@ class DockerStack:
             self.commands.extend(self.docker.config.prune(keep=15))
         if self.docker.secret:
             self.commands.extend(self.docker.secret.prune(keep=5))
+
+    def rm(self, stack_name):
+        self.commands.append(Command(["docker", "stack", "rm", stack_name], give_console=True))
 
     def push(self, compose_file):
         compose_data = self.read_compose_file(compose_file)
@@ -566,11 +838,14 @@ class DockerStack:
             return None
         if action == "push":
             cmd = self.docker.registry.push(image_name)
-            if cmd:
-                self.commands.append(cmd)
+            return cmd
+        return None
 
 
 class DockerNode:
+    def __init__(self, docker: Docker):
+        self.docker = docker
+
     @staticmethod
     def _format_labels(labels: Dict[str, str]) -> str:
         if not labels:
@@ -581,31 +856,7 @@ class DockerNode:
         return ", ".join(parts)
 
     @staticmethod
-    def ls():
-        nodes_output = subprocess.check_output(["docker", "node", "ls", "--format", "{{json .}}"], text=True).strip()
-        rows = []
-
-        for line in nodes_output.splitlines():
-            if not line:
-                continue
-            node = json.loads(line)
-            inspect = json.loads(
-                subprocess.check_output(["docker", "node", "inspect", node["ID"], "--format", "{{json .}}"], text=True).strip()
-            )
-            labels = inspect.get("Spec", {}).get("Labels", {})
-            manager_status = node.get("ManagerStatus", "").strip()
-            role = inspect.get("Spec", {}).get("Role", "-")
-            role_display = f"{role} ({manager_status})" if manager_status else role
-            rows.append(
-                {
-                    "hostname": node.get("Hostname", "-"),
-                    "role": role_display,
-                    "state": f"{node.get('Status', '-')} / {node.get('Availability', '-')}",
-                    "address": inspect.get("Status", {}).get("Addr", "-"),
-                    "labels": DockerNode._format_labels(labels),
-                }
-            )
-
+    def _print_rows(rows: List[Dict[str, str]]):
         columns = [
             ("Hostname", "hostname"),
             ("Role", "role"),
@@ -633,12 +884,99 @@ class DockerNode:
             for label_line in wrapped_labels[1:]:
                 print(f"{continuation_prefix} | {label_line}")
 
+    def ls(self):
+        manager_query = self.docker.stack._manager_client_for_feature(FEATURE_STACK_QUERY)
+        if manager_query:
+            try:
+                payload = manager_query.list_nodes()
+                rows = []
+                for item in payload.get("nodes", []):
+                    manager_status = str(item.get("manager_status") or "").strip()
+                    role = str(item.get("role") or "-")
+                    role_display = f"{role} ({manager_status})" if manager_status else role
+                    rows.append(
+                        {
+                            "hostname": str(item.get("hostname") or "-"),
+                            "role": role_display,
+                            "state": f"{item.get('state', '-')} / {item.get('availability', '-')}",
+                            "address": str(item.get("address") or "-"),
+                            "labels": DockerNode._format_labels(item.get("labels", {})),
+                        }
+                    )
+                DockerNode._print_rows(rows)
+                return rows
+            except RuntimeError:
+                pass
+
+        nodes_output = run_cli_command(["docker", "node", "ls", "--format", "{{json .}}"], log=False)
+        rows = []
+
+        for line in nodes_output.splitlines():
+            if not line:
+                continue
+            node = json.loads(line)
+            inspect = json.loads(
+                run_cli_command(["docker", "node", "inspect", node["ID"], "--format", "{{json .}}"], log=False)
+            )
+            labels = inspect.get("Spec", {}).get("Labels", {})
+            manager_status = node.get("ManagerStatus", "").strip()
+            role = inspect.get("Spec", {}).get("Role", "-")
+            role_display = f"{role} ({manager_status})" if manager_status else role
+            rows.append(
+                {
+                    "hostname": node.get("Hostname", "-"),
+                    "role": role_display,
+                    "state": f"{node.get('Status', '-')} / {node.get('Availability', '-')}",
+                    "address": inspect.get("Status", {}).get("Addr", "-"),
+                    "labels": DockerNode._format_labels(labels),
+                }
+            )
+
+        DockerNode._print_rows(rows)
+
         return rows
+
+
+def open_context_shell(config_dir: Path, context_name: str) -> int:
+    env = dict(os.environ)
+    env["DOCKER_CONFIG"] = str(config_dir)
+    env["DOCKER_CONTEXT"] = context_name
+    shell = env.get("SHELL", "").strip() or "/bin/bash"
+    return subprocess.run([shell, "-i"], check=False, env=env).returncode
 
 
 def main(args: List[str] = None):
     parser = argparse.ArgumentParser(description="Deploy and manage Docker stacks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    login_parser = subparsers.add_parser("login", help="Authenticate Docker CLI against Docker-Manager")
+    login_parser.add_argument("manager", nargs="?", help="Docker-Manager host or URL, for example 172.31.0.6:2378")
+    login_parser.add_argument("--manager-url", help="Docker-Manager base URL")
+    login_parser.add_argument("--context", "--context-name", dest="context_name", help="Docker context name to create or update")
+    login_parser.add_argument("--timeout-secs", type=int, help="Login timeout in seconds")
+
+    shell_parser = subparsers.add_parser("shell", help="Open an isolated bash shell for a Docker-Manager context")
+    shell_parser.add_argument("target", nargs="?", help="Context name, or manager host/URL when used with --context")
+    shell_parser.add_argument("--context", "--context-name", dest="context_name", help="Shell context name to create or reuse")
+    shell_parser.add_argument("--timeout-secs", type=int, help="Login timeout in seconds")
+
+    context_parser = subparsers.add_parser("context", help="Manage Docker context switching with docker-stack cleanup")
+    context_subparsers = context_parser.add_subparsers(dest="context_command", required=True)
+    context_use_parser = context_subparsers.add_parser("use", help="Switch Docker context and clean up manager auth when needed")
+    context_use_parser.add_argument("context_name", help="Docker context name to activate")
+
+    setup_auth_parser = subparsers.add_parser(
+        "setup-auth",
+        help="Configure isolated Docker auth/context for CI or non-interactive Docker-Manager access",
+    )
+    setup_auth_parser.add_argument("manager", nargs="?", help="Docker-Manager host or URL, for example 172.31.0.6:2378")
+    setup_auth_parser.add_argument("--manager-url", help="Docker-Manager base URL")
+    setup_auth_parser.add_argument("--context", "--context-name", dest="context_name", help="Docker context name to create or update")
+    setup_auth_parser.add_argument("--timeout-secs", type=int, help="Setup timeout in seconds")
+    setup_auth_parser.add_argument("--docker-config-dir", help="Docker config directory to create or reuse")
+    setup_auth_parser.add_argument("--access-token", help="Pre-issued manager access token")
+    setup_auth_parser.add_argument("--github-oidc-token", help="GitHub OIDC token for trusted publishing")
+    setup_auth_parser.add_argument("--verify-ssl", action="store_true", help=argparse.SUPPRESS)
 
     # Build subcommand
     build_parser = subparsers.add_parser("build", help="Build images using docker-compose")
@@ -654,6 +992,7 @@ def main(args: List[str] = None):
     deploy_parser.add_argument("stack_name", help="Name of the stack")
     deploy_parser.add_argument("compose_file", help="Path to the compose file")
     deploy_parser.add_argument("--with-registry-auth", action="store_true", help="Use registry authentication")
+    deploy_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Deployment namespace")
     deploy_parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
     deploy_parser.add_argument("--show-generated", action="store_true", default=True, help="Show newly generated secrets after deployment")
 
@@ -676,10 +1015,12 @@ def main(args: List[str] = None):
     )
     cat_parser.add_argument("stack_name", help="Name of the stack")
     cat_parser.add_argument("version", nargs="?", help="Stack version to cat. Defaults to latest if omitted.")
+    cat_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
 
     checkout_parser = subparsers.add_parser("checkout", help="Deploy specific version of the stack")
     checkout_parser.add_argument("stack_name", help="Name of the stack")
     checkout_parser.add_argument("version", help="Stack version to cat")
+    checkout_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
 
     # version_parser = subparsers.add_parser("version",help="Deploy specific version of the stack")
     # version_parser.add_argument("stack_name", help="Name of the stack")
@@ -687,6 +1028,7 @@ def main(args: List[str] = None):
 
     version_parser = subparsers.add_parser("version", aliases=["versions"], help="Deploy specific version of the stack")
     version_parser.add_argument("stack_name", help="Name of the stack")
+    version_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
 
     parser.add_argument(
         "-u", "--user", help="Registry credentials in format hostname:username:password", action="append", required=False, default=[]
@@ -699,6 +1041,97 @@ def main(args: List[str] = None):
 
     args = parser.parse_args(args if args else sys.argv[1:])
 
+    if args.command == "login":
+        try:
+            config = resolve_login_config(
+                manager_url=args.manager_url,
+                manager_target=args.manager,
+                context_name=args.context_name,
+                timeout_secs=args.timeout_secs,
+            )
+            result = docker_manager_login(config)
+        except RuntimeError as exc:
+            print(f"docker-stack login: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print("Docker-Manager browser login successful.")
+        print(f"Callback: {result.redirect_uri}")
+        print(f"DOCKER_CONTEXT={config.context_name}")
+        print(f"Context host={config.docker_context_host}")
+        if config.manager_url.startswith("https://"):
+            print(f"TLS detected for manager endpoint ({'verification skipped' if config.skip_tls_verify else 'verified'})")
+        expiry = format_expiry(result.expires_at)
+        if expiry:
+            print(f"Access token expires in {expiry}")
+        print("Try: docker ps")
+        return
+
+    if args.command == "shell":
+        shell_name = args.target if args.context_name is None else None
+        manager_target = args.target if args.context_name is not None else None
+        try:
+            config = resolve_shell_login_config(
+                shell_name=shell_name,
+                manager_target=manager_target,
+                context_name=args.context_name,
+                timeout_secs=args.timeout_secs,
+            )
+            config_dir, result = ensure_isolated_login(config)
+        except RuntimeError as exc:
+            print(f"docker-stack shell: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print(f"Shell context={config.context_name}")
+        print(f"Shell manager={config.manager_url}")
+        print(f"DOCKER_CONFIG={config_dir}")
+        if result is not None:
+            expiry = format_expiry(result.expires_at)
+            if expiry:
+                print(f"Access token expires in {expiry}")
+        else:
+            print("Access token already active.")
+        sys.exit(open_context_shell(config_dir, config.context_name))
+
+    if args.command == "setup-auth":
+        try:
+            config = resolve_login_config(
+                manager_url=args.manager_url,
+                manager_target=args.manager,
+                context_name=args.context_name,
+                timeout_secs=args.timeout_secs,
+                verify_ssl=args.verify_ssl,
+            )
+            result = docker_manager_setup_auth(
+                config,
+                access_token=args.access_token,
+                github_oidc_token=args.github_oidc_token,
+                docker_config_dir=Path(args.docker_config_dir) if args.docker_config_dir else None,
+            )
+        except RuntimeError as exc:
+            print(f"docker-stack setup-auth: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print(f"DOCKER_CONFIG={result.docker_config_dir}")
+        print(f"DOCKER_CONTEXT={result.context_name}")
+        print(f"MANAGER_URL={result.manager_url}")
+        print(f"SKIP_TLS_VERIFY={'true' if result.skip_tls_verify else 'false'}")
+        expiry = format_expiry(result.expires_at)
+        if expiry:
+            print(f"ACCESS_TOKEN_EXPIRES_IN={expiry}")
+        print(f"VALIDATION_SKIPPED={'true' if result.validation_skipped else 'false'}")
+        return
+
+    if args.command == "context":
+        if args.context_command == "use":
+            try:
+                manager_context = switch_docker_context(args.context_name)
+            except RuntimeError as exc:
+                print(f"docker-stack context use: {exc}", file=sys.stderr)
+                sys.exit(2)
+            print(f"DOCKER_CONTEXT={args.context_name}")
+            if manager_context:
+                print("Docker-Manager auth header preserved.")
+            else:
+                print("Docker-Manager auth header cleared from ~/.docker/config.json.")
+            return
+
     docker = Docker(registries=args.user)
     docker.load_env()
 
@@ -707,7 +1140,15 @@ def main(args: List[str] = None):
     elif args.command == "push":
         docker.stack.push(args.compose_file)
     elif args.command == "deploy":
-        docker.stack.deploy(args.stack_name, args.compose_file, args.with_registry_auth, tag=args.tag, show_generated=args.show_generated)
+        docker.stack.deploy(
+            args.stack_name,
+            args.compose_file,
+            args.with_registry_auth,
+            tag=args.tag,
+            show_generated=args.show_generated,
+            namespace=args.namespace,
+            dry_run=args.ro,
+        )
     elif args.command == "ls":
         docker.stack.ls()
     elif args.command == "node":
@@ -721,7 +1162,7 @@ def main(args: List[str] = None):
     elif args.command == "cat":
         version_to_cat = args.version
         if version_to_cat is None:
-            versions_list = docker.stack.versions(args.stack_name)
+            versions_list = docker.stack.versions(args.stack_name, namespace=args.namespace, print_output=False)
             if versions_list:
                 # Assuming versions are integers, find the maximum
                 latest_version = max(int(v[0]) for v in versions_list if v[0].isdigit())
@@ -729,11 +1170,16 @@ def main(args: List[str] = None):
             else:
                 print(f"No versions found for stack '{args.stack_name}'.")
                 sys.exit(1)
-        print(docker.stack.cat(args.stack_name, version_to_cat))
+        print(docker.stack.cat(args.stack_name, version_to_cat, namespace=args.namespace))
     elif args.command == "checkout":
-        docker.stack.checkout(args.stack_name, args.version)
+        docker.stack.checkout(
+            args.stack_name,
+            args.version,
+            namespace=args.namespace,
+            dry_run=args.ro,
+        )
     elif args.command == "versions" or args.command == "version":
-        docker.stack.versions(args.stack_name)
+        docker.stack.versions(args.stack_name, namespace=args.namespace)
     if args.ro:
         print("Following commands were not executed:")
         [print(" >> " + str(x)) for x in docker.stack.commands if x]
@@ -742,4 +1188,4 @@ def main(args: List[str] = None):
 
 
 if __name__ == "__main__":
-    main([""])
+    main()

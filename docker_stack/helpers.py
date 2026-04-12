@@ -1,8 +1,9 @@
 import random
 import string
-import subprocess
 import sys
-from typing import List, Optional, Union, Dict
+from typing import Callable, Dict, List, Optional, Union
+
+from docker_stack.command_runner import run_command
 
 
 def generate_secret(
@@ -74,21 +75,25 @@ def run_cli_command(
     Returns:
         The stdout of the command as a string, or None if interactive mode is enabled.
     """
-    if log:
-        print("> " + " ".join(command), flush=True)
-
     try:
+        result = run_command(
+            command,
+            stdin=stdin,
+            raise_error=raise_error,
+            log=log,
+            shell=shell,
+            interactive=interactive,
+            cwd=cwd,
+            capture_output=not interactive,
+        )
         if interactive:
-            result = subprocess.run(command, shell=shell, cwd=cwd)
             return None
-        else:
-            result = subprocess.run(command, input=stdin, text=True, capture_output=True, check=raise_error, shell=shell, cwd=cwd)
-            return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
+        return (result.stdout or "").strip()
+    except Exception as e:
         # Log the error and re-raise the exception
         print(f"Error running command: {e}")
-        print(f"stdout: {e.stdout}")
-        print(f"stderr: {e.stderr}")
+        print(f"stdout: {getattr(e, 'stdout', None)}")
+        print(f"stderr: {getattr(e, 'stderr', None)}")
         raise e
 
 
@@ -132,13 +137,14 @@ class Command:
             print("> " + " ".join(self.command), flush=True)
 
         if not self.stdin:
-            # if self.give_console:
-            #     print("Giving console")
-            #     process = subprocess.Popen(self.command, shell=True,cwd=self.cwd)
-            #     process.wait()
-            #     return process
-            # else:
-            result = subprocess.run(self.command)
+            result = run_command(
+                self.command,
+                raise_error=False,
+                log=False,
+                interactive=self.give_console,
+                cwd=self.cwd,
+                capture_output=False,
+            )
             if result.returncode != 0:
                 sys.exit(result.returncode)
         else:
@@ -160,3 +166,15 @@ class Command:
 
 
 Command.nop = Command([])
+
+
+class CallbackCommand:
+    def __init__(self, label: str, callback: Callable[[], Optional[str]]):
+        self.label = label
+        self.callback = callback
+
+    def execute(self, log: Optional[bool] = None) -> Optional[str]:
+        return self.callback()
+
+    def __str__(self) -> str:
+        return self.label

@@ -1,10 +1,9 @@
 import json
 import http.client
-import select
-import subprocess
 from base64 import b64encode
 from typing import Dict, List
 
+from docker_stack.command_runner import run_command
 from docker_stack.helpers import Command
 from docker_stack.url_parser import ConnectionDetails, parse_url
 import os
@@ -137,28 +136,9 @@ class DockerRegistry:
         :return: None
         """
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-
-            # Use select to handle both stdout and stderr without blocking
-            while process.poll() is None:
-                readable, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
-                for stream in readable:
-                    line = stream.readline()
-                    if line:
-                        print(line, end="", flush=True)
-
-            # Ensure remaining output is printed
-            for stream in (process.stdout, process.stderr):
-                for line in iter(stream.readline, ""):
-                    print(line, end="", flush=True)
-
-            process.stdout.close()
-            process.stderr.close()
-            process.wait()
-
-            if process.returncode != 0:
-                print(f"Command failed with return code {process.returncode}")
-
+            result = run_command(command, interactive=True, capture_output=False)
+            if result.returncode != 0:
+                print(f"Command failed with return code {result.returncode}")
         except FileNotFoundError:
             print("Docker command not found. Please ensure Docker is installed and accessible.")
 
@@ -170,7 +150,7 @@ class DockerRegistry:
         :return: Tuple of (stdout, stderr)
         """
         try:
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            result = run_command(command, raise_error=False, log=False, capture_output=True)
             return result.stdout, result.stderr
         except FileNotFoundError:
             return "", "Docker not found. Please install Docker."
@@ -206,7 +186,10 @@ class DockerRegistry:
             registry = self.registries.get(hostname)
             if registry:
                 print("> ", " ".join(["docker", "login", "-u", registry["username"], "-p", "[redacted]", registry["host"]]))
-                subprocess.run(["docker", "login", "-u", registry["username"], "-p", registry["password"], registry["host"]])
+                run_command(
+                    ["docker", "login", "-u", registry["username"], "-p", registry["password"], registry["host"]],
+                    capture_output=False,
+                )
                 self.authenticated.add(hostname)
         return hostname
 

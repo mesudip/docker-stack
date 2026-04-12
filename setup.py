@@ -11,6 +11,9 @@ setup(
     url="https://github.com/mesudip/docker-stack",  # Replace with your project URL
     packages=find_packages(),
     install_requires=["PyYAML"],
+    extras_require={
+        "dev": ["pytest>=8,<9"],
+    },
     entry_points={
         "console_scripts": [
             "docker-stack=docker_stack.cli:main",  # The function main() inside docker_stack.cli module
