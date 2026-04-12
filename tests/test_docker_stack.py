@@ -229,7 +229,7 @@ def test_process_x_content_uses_manager_resolve_apis(monkeypatch):
         {
             "stack": "govtool",
             "namespace": "default",
-            "name": "govtool_app.conf",
+            "name": "app.conf",
             "content": "hello",
             "labels": {},
         }
@@ -238,7 +238,7 @@ def test_process_x_content_uses_manager_resolve_apis(monkeypatch):
         {
             "stack": "govtool",
             "namespace": "default",
-            "name": "govtool_app-secret",
+            "name": "app-secret",
             "content": None,
             "generate": {
                 "length": 24,
@@ -250,8 +250,8 @@ def test_process_x_content_uses_manager_resolve_apis(monkeypatch):
             "return_generated_value": True,
         }
     ]
-    assert processed_configs == {"app.conf": {"name": "govtool_app.conf_v2", "external": True}}
-    assert processed_secrets == {"app-secret": {"name": "govtool_app-secret", "external": True}}
+    assert processed_configs == {"app.conf": {"name": "app.conf_v2", "external": True}}
+    assert processed_secrets == {"app-secret": {"name": "app-secret", "external": True}}
     assert docker.stack.generated_secrets == {"app-secret": "generated-from-manager"}
 
 

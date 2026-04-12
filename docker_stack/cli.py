@@ -329,12 +329,13 @@ class DockerStack:
             docker_object_name = docker_object_name_for(name, explicit_name=explicit_name)
 
             if manager_client and stack:
+                manager_object_name = explicit_name or name
                 label_map = normalize_labels(labels)
                 if manager.object_type == "config":
                     response = manager_client.resolve_config(
                         stack=stack,
                         namespace=namespace,
-                        name=docker_object_name,
+                        name=manager_object_name,
                         content=data,
                         labels=label_map,
                     )
@@ -342,7 +343,7 @@ class DockerStack:
                     response = manager_client.resolve_secret(
                         stack=stack,
                         namespace=namespace,
-                        name=docker_object_name,
+                        name=manager_object_name,
                         content=None if is_generated_secret else data,
                         generate=generate_options if is_generated_secret else None,
                         labels=label_map,
