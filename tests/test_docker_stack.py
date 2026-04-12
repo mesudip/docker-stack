@@ -295,6 +295,33 @@ def test_rm_enqueues_stack_remove_command():
     assert docker.stack.commands[-1].command == ["docker", "stack", "rm", "govtool"]
 
 
+def test_default_namespace_stack_names_are_normalized_in_output(monkeypatch, capsys):
+    inspect_payloads = {
+        ("docker", "config", "ls", "--format", "{{.ID}}	{{.Name}}	{{.Labels}}"):
+            "cfg1	default--team-a	mesudip.stack.name=default--team-a,mesudip.object.version=1",
+        ("docker", "config", "ls", "--format", "{{.Name}}	{{.Labels}}"):
+            "default--team-a	mesudip.stack.name=default--team-a,mesudip.object.version=1,mesudip.stack.tag=stable",
+        ("docker", "config", "inspect", "team-a"):
+            json.dumps([{"Spec": {"Data": base64.b64encode(b"services:\n  api:\n    image: busybox\n").decode("utf-8")}}]),
+    }
+
+    def fake_run_cli_command(command, **kwargs):
+        key = tuple(command)
+        if key not in inspect_payloads:
+            raise AssertionError(f"Unexpected command: {command}")
+        return inspect_payloads[key]
+
+    monkeypatch.setattr("docker_stack.cli.run_cli_command", fake_run_cli_command)
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+
+    docker = Docker()
+    assert docker.stack.ls() == {"team-a": ["1"]}
+    assert docker.stack.versions("team-a") == [("1", "stable")]
+    output = capsys.readouterr().out
+    assert "default--team-a" not in output
+    assert "team-a" in output
+
+
 def test_filtered_agent_outputs_still_render(monkeypatch, capsys):
     inspect_payloads = {
         ("docker", "config", "ls", "--format", "{{.ID}}\t{{.Name}}\t{{.Labels}}"): "\n".join(
