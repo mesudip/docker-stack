@@ -249,6 +249,60 @@ class ManagerApiClient:
 
         return {"nodes": nodes}
 
+
+
+    def resolve_config(
+        self,
+        *,
+        stack: str,
+        namespace: str,
+        name: str,
+        content: str,
+        labels: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "stack": stack,
+            "namespace": namespace,
+            "name": name,
+            "content": content,
+        }
+        if labels:
+            payload["labels"] = labels
+        return self._request_json(
+            "/api/configs/resolve",
+            method="POST",
+            payload=payload,
+        )
+
+    def resolve_secret(
+        self,
+        *,
+        stack: str,
+        namespace: str,
+        name: str,
+        content: Optional[str] = None,
+        generate: Optional[Dict[str, Any]] = None,
+        labels: Optional[Dict[str, str]] = None,
+        return_generated_value: bool = False,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "stack": stack,
+            "namespace": namespace,
+            "name": name,
+            "return_generated_value": return_generated_value,
+        }
+        if content is not None:
+            payload["content"] = content
+        if generate is not None:
+            payload["generate"] = generate
+        if labels:
+            payload["labels"] = labels
+        return self._request_json(
+            "/api/secrets/resolve",
+            method="POST",
+            payload=payload,
+        )
+
     def validate_stack(
         self,
         *,

@@ -303,23 +303,59 @@ class DockerStack:
         Returns a tuple: (processed_objects, commands)
         """
         processed_objects = {}
+        manager_client = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
+        namespace = os.getenv("DOCKER_STACK_NAMESPACE", "default")
 
-        def add_obj(name, data, explicit_name=None, is_generated_secret=False):
+        def docker_object_name_for(name, explicit_name=None):
+            if explicit_name:
+                return explicit_name
+            if stack:
+                return f"{stack}_{name}"
+            return name
+
+        def normalize_labels(labels):
+            normalized = {}
+            for raw in labels:
+                key, _, value = raw.partition("=")
+                if key and _:
+                    normalized[key] = value
+            return normalized
+
+        def add_obj(name, data, explicit_name=None, is_generated_secret=False, generate_options=None):
             labels = []
             if is_generated_secret:
                 labels.append("mesudip.secret.generated=true")
 
-            if explicit_name:
-                docker_object_name = explicit_name
-            elif stack:
-                docker_object_name = f"{stack}_{name}"
-            else:
-                docker_object_name = name
+            docker_object_name = docker_object_name_for(name, explicit_name=explicit_name)
+
+            if manager_client and stack:
+                label_map = normalize_labels(labels)
+                if manager.object_type == "config":
+                    response = manager_client.resolve_config(
+                        stack=stack,
+                        namespace=namespace,
+                        name=docker_object_name,
+                        content=data,
+                        labels=label_map,
+                    )
+                else:
+                    response = manager_client.resolve_secret(
+                        stack=stack,
+                        namespace=namespace,
+                        name=docker_object_name,
+                        content=None if is_generated_secret else data,
+                        generate=generate_options if is_generated_secret else None,
+                        labels=label_map,
+                        return_generated_value=is_generated_secret,
+                    )
+                    if is_generated_secret and response.get("generated_value"):
+                        self.generated_secrets[name] = response["generated_value"]
+                processed_objects[name] = {"name": response["actual_name"], "external": True}
+                return
 
             (object_name, command) = manager.create(docker_object_name, data, labels=labels, stack=stack)
             if not command.isNop():
                 self.commands.append(command)
-                # If a new secret was actually created (not just reused), store it
                 if is_generated_secret:
                     self.generated_secrets[name] = data
             processed_objects[name] = {"name": object_name, "external": True}
@@ -338,28 +374,40 @@ class DockerStack:
                 with open(filename) as file:
                     add_obj(name, file.read(), explicit_name=explicit_name)
             elif isinstance(details, dict) and "x-generate" in details and manager.object_type == "secret":
-                is_generated_secret = True
                 generate_options = details["x-generate"]
-                secret_content = ""
-
-                # Determine the content to be used for the secret
-                # This logic is now simplified as DockerObjectManager.create handles persistence
                 if isinstance(generate_options, bool) and generate_options:
-                    secret_content = generate_secret()
+                    if manager_client and stack:
+                        add_obj(name, "", explicit_name=explicit_name, is_generated_secret=True, generate_options={})
+                    else:
+                        add_obj(name, generate_secret(), explicit_name=explicit_name, is_generated_secret=True)
                 elif isinstance(generate_options, int):
-                    secret_content = generate_secret(length=generate_options)
+                    if manager_client and stack:
+                        add_obj(name, "", explicit_name=explicit_name, is_generated_secret=True, generate_options={"length": generate_options})
+                    else:
+                        add_obj(name, generate_secret(length=generate_options), explicit_name=explicit_name, is_generated_secret=True)
                 elif isinstance(generate_options, dict):
-                    secret_content = generate_secret(
-                        length=generate_options.get("length"),
-                        numbers=generate_options.get("numbers", True),
-                        special=generate_options.get("special", True),
-                        uppercase=generate_options.get("uppercase", True),
-                    )
+                    options = {
+                        "length": generate_options.get("length"),
+                        "numbers": generate_options.get("numbers", True),
+                        "special": generate_options.get("special", True),
+                        "uppercase": generate_options.get("uppercase", True),
+                    }
+                    if manager_client and stack:
+                        add_obj(name, "", explicit_name=explicit_name, is_generated_secret=True, generate_options=options)
+                    else:
+                        add_obj(
+                            name,
+                            generate_secret(
+                                length=options.get("length"),
+                                numbers=options.get("numbers", True),
+                                special=options.get("special", True),
+                                uppercase=options.get("uppercase", True),
+                            ),
+                            explicit_name=explicit_name,
+                            is_generated_secret=True,
+                        )
                 else:
                     raise ValueError(f"Invalid x-generate value for secret {name}: {generate_options}")
-
-                # Call add_obj with the potentially new secret content and the generated flag
-                add_obj(name, secret_content, explicit_name=explicit_name, is_generated_secret=True)
             else:
                 processed_objects[name] = details
         return processed_objects

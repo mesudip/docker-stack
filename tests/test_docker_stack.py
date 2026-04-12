@@ -32,6 +32,8 @@ class FakeManagerClient:
         self.features = {"docker_stack_query_v1", "docker_stack_deploy_v1"}
         self.deploy_payloads = []
         self.rollback_payloads = []
+        self.resolve_config_payloads = []
+        self.resolve_secret_payloads = []
 
     def supports(self, feature_name):
         return feature_name in self.features
@@ -82,6 +84,47 @@ class FakeManagerClient:
                 }
             ]
         }
+
+    def resolve_config(self, *, stack, namespace, name, content, labels=None):
+        self.resolve_config_payloads.append(
+            {
+                "stack": stack,
+                "namespace": namespace,
+                "name": name,
+                "content": content,
+                "labels": labels or {},
+            }
+        )
+        return {
+            "logical_name": name,
+            "actual_name": f"{name}_v2",
+            "version": 2,
+            "created": True,
+            "changed": True,
+        }
+
+    def resolve_secret(self, *, stack, namespace, name, content=None, generate=None, labels=None, return_generated_value=False):
+        self.resolve_secret_payloads.append(
+            {
+                "stack": stack,
+                "namespace": namespace,
+                "name": name,
+                "content": content,
+                "generate": generate,
+                "labels": labels or {},
+                "return_generated_value": return_generated_value,
+            }
+        )
+        payload = {
+            "logical_name": name,
+            "actual_name": name,
+            "version": 1,
+            "created": True,
+            "changed": True,
+        }
+        if return_generated_value:
+            payload["generated_value"] = "generated-from-manager"
+        return payload
 
     def deploy_stack(self, *, stack, namespace, compose, options=None):
         self.deploy_payloads.append(
@@ -149,6 +192,67 @@ def test_process_x_content_preserves_explicit_name_override():
         }
     ]
     assert processed == {"config.json": {"name": "shared-config", "external": True}}
+
+
+def test_process_x_content_uses_manager_resolve_apis(monkeypatch):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+
+    docker = Docker()
+    docker.stack._manager_client = fake_manager
+
+    processed_configs = docker.stack._process_x_content(
+        {
+            "app.conf": {
+                "x-content": "hello",
+            }
+        },
+        docker.config,
+        stack="govtool",
+    )
+    processed_secrets = docker.stack._process_x_content(
+        {
+            "app-secret": {
+                "x-generate": {
+                    "length": 24,
+                    "numbers": True,
+                    "special": False,
+                    "uppercase": True,
+                }
+            }
+        },
+        docker.secret,
+        stack="govtool",
+    )
+
+    assert fake_manager.resolve_config_payloads == [
+        {
+            "stack": "govtool",
+            "namespace": "default",
+            "name": "govtool_app.conf",
+            "content": "hello",
+            "labels": {},
+        }
+    ]
+    assert fake_manager.resolve_secret_payloads == [
+        {
+            "stack": "govtool",
+            "namespace": "default",
+            "name": "govtool_app-secret",
+            "content": None,
+            "generate": {
+                "length": 24,
+                "numbers": True,
+                "special": False,
+                "uppercase": True,
+            },
+            "labels": {"mesudip.secret.generated": "true"},
+            "return_generated_value": True,
+        }
+    ]
+    assert processed_configs == {"app.conf": {"name": "govtool_app.conf_v2", "external": True}}
+    assert processed_secrets == {"app-secret": {"name": "govtool_app-secret", "external": True}}
+    assert docker.stack.generated_secrets == {"app-secret": "generated-from-manager"}
 
 
 def test_build_uses_service_dockerfile(tmp_path):
