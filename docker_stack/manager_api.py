@@ -110,7 +110,16 @@ class ManagerApiClient:
             with urllib.request.urlopen(request, timeout=self.timeout_secs, context=context) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Manager request failed ({method} {path}): HTTP {exc.code}") from exc
+            body = ""
+            try:
+                payload = exc.read().decode("utf-8", errors="replace").strip()
+                if payload:
+                    body = f": {payload}"
+            except Exception:
+                body = ""
+            raise RuntimeError(
+                f"Manager request failed ({method} {path}): HTTP {exc.code}{body}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Manager request failed ({method} {path}): {exc.reason}") from exc
         except json.JSONDecodeError as exc:

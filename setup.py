@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="docker-stack",
-    version="2.0.3",
+    version="2.0.4",
     description="CLI for deploying and managing Docker stacks.",
     long_description=open("README.md").read(),  # You can include a README file to describe your package
     long_description_content_type="text/markdown",
