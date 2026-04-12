@@ -433,12 +433,6 @@ class DockerStack:
     @staticmethod
     def _version_sort_key(raw: str):
         return int(raw) if raw.isdigit() else raw
-    @staticmethod
-    def _display_stack_name(raw: str) -> str:
-        value = raw.strip()
-        if value.startswith("default--"):
-            return value[len("default--"):]
-        return value
 
     def _print_stack_listing(self, stack_versions: Dict[str, List[str]]) -> None:
         max_stack_name_length = max(len(stack) for stack in stack_versions) if stack_versions else 10
@@ -468,7 +462,7 @@ class DockerStack:
             try:
                 payload = client.list_stacks()
                 stack_versions = {
-                    self._display_stack_name(str(item.get("stack"))): [
+                    str(item.get("stack")): [
                         str(version)
                         for version in (
                             item.get("versions")
@@ -494,7 +488,7 @@ class DockerStack:
             parts = line.split("\t")
             if len(parts) == 3 and "mesudip.stack.name" in parts[2]:
                 labels = {k: v for k, v in (label.split("=") for label in parts[2].split(",") if "=" in label)}
-                stack_name = self._display_stack_name(labels.get("mesudip.stack.name", "")) or None
+                stack_name = labels.get("mesudip.stack.name")
                 version = labels.get("mesudip.object.version", "unknown")
 
                 if stack_name:
@@ -565,7 +559,7 @@ class DockerStack:
             parts = line.split("\t")
             if len(parts) == 2 and "mesudip.stack.name" in parts[1]:
                 labels = {k: v for k, v in (label.split("=") for label in parts[1].split(",") if "=" in label)}
-                stack = self._display_stack_name(labels.get("mesudip.stack.name", "")) or None
+                stack = labels.get("mesudip.stack.name")
                 version = labels.get("mesudip.object.version", "unknown")
                 tag = labels.get("mesudip.stack.tag", "")
 
