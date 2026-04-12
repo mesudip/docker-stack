@@ -311,7 +311,10 @@ def test_checkout_uses_manager_fast_path_for_tag(monkeypatch):
 def test_deploy_enqueues_manager_callback_when_supported(monkeypatch, tmp_path):
     fake_manager = FakeManagerClient()
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
-    monkeypatch.setattr("docker_stack.cli.run_cli_command", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        "docker_stack.cli.run_cli_command",
+        lambda *args, **kwargs: pytest.fail("manager-backed deploy should not hit direct daemon CLI"),
+    )
     compose_file = tmp_path / "docker-compose.yml"
     compose_file.write_text("services:\n  api:\n    image: busybox\n")
 

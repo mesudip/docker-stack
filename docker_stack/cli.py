@@ -639,10 +639,9 @@ class DockerStack:
             )
             return
 
-        _, cmd = self.docker.config.increment(stack_name, rendered_content, labels=labels, stack=stack_name)
-        if not cmd.isNop():
-            self.commands.append(cmd)
-
+        # Manager-backed deploys must stay on the manager stack APIs. Hitting
+        # direct daemon config endpoints here breaks GitHub OIDC workflows,
+        # which are intentionally restricted away from generic daemon access.
         if manager_deploy and not with_registry_auth:
             self.commands.append(
                 CallbackCommand(
@@ -656,6 +655,10 @@ class DockerStack:
                 )
             )
             return
+
+        _, cmd = self.docker.config.increment(stack_name, rendered_content, labels=labels, stack=stack_name)
+        if not cmd.isNop():
+            self.commands.append(cmd)
 
         cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
         if with_registry_auth:
