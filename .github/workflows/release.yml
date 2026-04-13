@@ -3,7 +3,8 @@ name: Publish to PyPI
 on:
   push:
     tags:
-      - 'v*'
+      # Publish only for full release tags like v2.0.7, not moving major tags like v2.
+      - 'v*.*.*'
 
 permissions:
   deployments: write
