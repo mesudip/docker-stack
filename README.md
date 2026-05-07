@@ -38,7 +38,9 @@ What this gives you on a raw Docker daemon:
 
 ### GitHub Actions
 
-If you want to use `docker-stack` directly in a workflow, install the package explicitly:
+#### 1. Normal Docker daemon
+
+Use this when the runner already has Docker access through the default Docker context or `DOCKER_HOST`.
 
 ```yaml
 steps:
@@ -49,6 +51,27 @@ steps:
   - run: python3 -m pip install --upgrade docker-stack
   - run: docker-stack deploy my-stack docker-compose.yml
 ```
+
+This uses the normal Docker CLI path and runs `docker config` / `docker stack deploy` against the configured daemon.
+
+#### 2. Docker-Manager
+
+Use the bundled action when deploying through Docker-Manager:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: mesudip/docker-stack@main
+    with:
+      manager: https://manager.example.com:2378
+  - run: docker-stack deploy --with-registry-auth my-stack docker-compose.yml
+```
+
+The action installs `docker-stack`, defaults to GitHub OIDC auth and the `dm-proxy` context, exports `DOCKER_CONFIG`, `DOCKER_CONTEXT`, and `DOCKER_MANAGER_URL` for later steps, and removes its generated Docker config directory in the post-action cleanup phase.
 
 ## Core Capabilities
 
