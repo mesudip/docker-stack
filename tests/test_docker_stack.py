@@ -5,10 +5,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
-from docker_stack.cli import Docker
+from docker_stack.cli import DOCKER_SHELL_ENDPOINT_ENV_VARS, Docker, active_shell_config_dir, open_context_shell
 from docker_stack.helpers import Command
 from docker_stack import main
+
+
+def decode_x_files(compose_content):
+    data = yaml.safe_load(compose_content)
+    return {
+        item["path"]: base64.b64decode(item["content"]).decode("utf-8")
+        for item in data.get("x-files", [])
+    }
 
 
 class RecordingManager:
@@ -194,6 +203,76 @@ def test_process_x_content_preserves_explicit_name_override():
     assert processed == {"config.json": {"name": "shared-config", "external": True}}
 
 
+def test_process_x_content_supports_x_generated_alias_for_secrets(monkeypatch):
+    docker = Docker()
+    manager = RecordingManager()
+    manager.object_type = "secret"
+
+    monkeypatch.setattr("docker_stack.cli.generate_secret", lambda **_kwargs: "alias-generated-secret")
+
+    processed = docker.stack._process_x_content(
+        {
+            "db_password": {
+                "x-generated": {
+                    "length": 20,
+                    "numbers": True,
+                    "special": False,
+                    "uppercase": True,
+                }
+            }
+        },
+        manager,
+        stack="govtool",
+    )
+
+    assert manager.calls == [
+        {
+            "object_name": "govtool_db_password",
+            "object_content": "alias-generated-secret",
+            "labels": ["mesudip.secret.generated=true"],
+            "stack": "govtool",
+        }
+    ]
+    assert processed == {"db_password": {"name": "govtool_db_password", "external": True}}
+
+
+def test_process_x_content_supports_secret_environment(monkeypatch):
+    docker = Docker()
+    manager = RecordingManager()
+    manager.object_type = "secret"
+    monkeypatch.setenv("API_TOKEN", "secret-from-env")
+
+    processed = docker.stack._process_x_content(
+        {"api_token": {"environment": "API_TOKEN"}},
+        manager,
+        stack="govtool",
+    )
+
+    assert manager.calls == [
+        {
+            "object_name": "govtool_api_token",
+            "object_content": "secret-from-env",
+            "labels": [],
+            "stack": "govtool",
+        }
+    ]
+    assert processed == {"api_token": {"name": "govtool_api_token", "external": True}}
+
+
+def test_process_x_content_secret_environment_requires_value(monkeypatch):
+    docker = Docker()
+    manager = RecordingManager()
+    manager.object_type = "secret"
+    monkeypatch.delenv("API_TOKEN", raising=False)
+
+    with pytest.raises(ValueError, match="Secret api_token references environment variable API_TOKEN, but it is not set"):
+        docker.stack._process_x_content(
+            {"api_token": {"environment": "API_TOKEN"}},
+            manager,
+            stack="govtool",
+        )
+
+
 def test_process_x_content_uses_manager_resolve_apis(monkeypatch):
     fake_manager = FakeManagerClient()
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
@@ -253,6 +332,66 @@ def test_process_x_content_uses_manager_resolve_apis(monkeypatch):
     assert processed_configs == {"app.conf": {"name": "app.conf_v2", "external": True}}
     assert processed_secrets == {"app-secret": {"name": "app-secret", "external": True}}
     assert docker.stack.generated_secrets == {"app-secret": "generated-from-manager"}
+
+
+def test_rendered_compose_stores_source_metadata_without_secret_files(monkeypatch, tmp_path):
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("docker_stack.docker_objects.DockerObjectManager.check", lambda *_args, **_kwargs: False)
+    monkeypatch.setenv("APP_HOST", "app.internal")
+    monkeypatch.setenv("SECRET_ENV", "do-not-store")
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "configs" / "app.conf").write_text("host=${APP_HOST}\n")
+    (tmp_path / "configs" / "raw.conf").write_text("raw=$RAW_VALUE\n")
+    (tmp_path / "secrets" / "token.txt").write_text("secret file content\n")
+    compose_text = """services:
+  api:
+    image: busybox
+    environment:
+      - APP_HOST=${APP_HOST}
+configs:
+  templated:
+    x-template-file: ./configs/app.conf
+  raw:
+    file: ./configs/raw.conf
+secrets:
+  file_secret:
+    file: ./secrets/token.txt
+  env_secret:
+    environment: SECRET_ENV
+"""
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(compose_text)
+
+    rendered = Docker().stack.render_compose_file(str(compose_file), stack="govtool", include_build=False)
+
+    x_files = decode_x_files(rendered.enriched)
+    assert x_files["compose.yml"] == compose_text
+    assert x_files["configs/app.conf"] == "host=${APP_HOST}\n"
+    assert x_files["configs/raw.conf"] == "raw=$RAW_VALUE\n"
+    assert "secrets/token.txt" not in x_files
+    assert x_files[".env"] == "APP_HOST=app.internal\n"
+    enriched_data = yaml.safe_load(rendered.enriched)
+    clean_data = yaml.safe_load(rendered.clean)
+    assert "x-files" in enriched_data
+    assert "x-files" not in clean_data
+    assert clean_data["configs"]["templated"] == {"name": "govtool_templated", "external": True}
+    assert clean_data["secrets"]["env_secret"] == {"name": "govtool_env_secret", "external": True}
+
+
+def test_rendered_compose_normalizes_main_source_name(monkeypatch, tmp_path):
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("docker_stack.docker_objects.DockerObjectManager.check", lambda *_args, **_kwargs: False)
+    compose_text = "services:\n  api:\n    image: busybox\n"
+    compose_file = tmp_path / "custom-stack-name.yaml"
+    compose_file.write_text(compose_text)
+
+    rendered = Docker().stack.render_compose_file(str(compose_file), stack="govtool", include_build=False)
+
+    assert decode_x_files(rendered.enriched)["compose.yml"] == compose_text
+    assert "custom-stack-name.yaml" not in decode_x_files(rendered.enriched)
 
 
 def test_build_uses_service_dockerfile(tmp_path):
@@ -428,6 +567,101 @@ def test_deploy_enqueues_manager_callback_when_supported(monkeypatch, tmp_path):
     assert "docker-manager stack deploy team-a" in str(docker.stack.commands[-1])
     docker.stack.commands[-1].execute()
     assert fake_manager.deploy_payloads[-1]["stack"] == "team-a"
+    assert "x-files:" in fake_manager.deploy_payloads[-1]["compose"]
+    assert decode_x_files(fake_manager.deploy_payloads[-1]["compose"])["compose.yml"] == "services:\n  api:\n    image: busybox\n"
+    assert fake_manager.deploy_payloads[-1]["options"] == {}
+
+
+def test_manager_deploy_preserves_with_registry_auth_option(monkeypatch, tmp_path):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    monkeypatch.setattr(
+        "docker_stack.cli.run_cli_command",
+        lambda *args, **kwargs: pytest.fail("manager-backed deploy should not hit direct daemon CLI"),
+    )
+    monkeypatch.setattr(
+        "docker_stack.docker_objects.run_cli_command",
+        lambda *args, **kwargs: pytest.fail("manager-backed deploy should not hit direct daemon CLI"),
+    )
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  api:\n    image: busybox\n")
+
+    docker = Docker()
+    docker.stack.deploy("team-a", str(compose_file), with_registry_auth=True)
+
+    assert "docker-manager stack deploy team-a" in str(docker.stack.commands[-1])
+    docker.stack.commands[-1].execute()
+    assert fake_manager.deploy_payloads[-1]["stack"] == "team-a"
+    assert fake_manager.deploy_payloads[-1]["options"] == {"with_registry_auth": True}
+
+
+def test_manager_checkout_with_registry_auth_uses_deploy_api(monkeypatch):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    monkeypatch.setattr(
+        "docker_stack.cli.run_cli_command",
+        lambda *args, **kwargs: pytest.fail("manager-backed checkout should not hit direct daemon CLI"),
+    )
+    monkeypatch.setattr(
+        "docker_stack.docker_objects.run_cli_command",
+        lambda *args, **kwargs: pytest.fail("manager-backed checkout should not hit direct daemon CLI"),
+    )
+
+    docker = Docker()
+    docker.stack.checkout("team-a", "2", with_registry_auth=True)
+
+    assert "docker-manager stack deploy team-a" in str(docker.stack.commands[-1])
+    docker.stack.commands[-1].execute()
+    assert fake_manager.rollback_payloads == []
+    assert fake_manager.deploy_payloads[-1]["stack"] == "team-a"
+    assert fake_manager.deploy_payloads[-1]["options"] == {"with_registry_auth": True}
+
+
+def test_deploy_passes_rendered_compose_over_stdin(monkeypatch, tmp_path):
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", lambda *_args, **_kwargs: "")
+    project_dir = tmp_path / "New project"
+    project_dir.mkdir()
+    compose_file = project_dir / "docker-stack.yml"
+    compose_file.write_text("services:\n  api:\n    image: busybox\n")
+
+    monkeypatch.chdir(project_dir)
+    docker = Docker()
+    docker.stack.deploy("wakapi", "./docker-stack.yml")
+
+    deploy = docker.stack.commands[-1]
+    assert deploy.command == ["docker", "stack", "deploy", "-c", "-", "wakapi"]
+    assert deploy.stdin == "services:\n  api:\n    image: busybox\n"
+    assert "x-files:" in docker.stack.commands[0].stdin
+    assert "x-files:" not in deploy.stdin
+    assert not (project_dir / "docker-stack-rendered.yml").exists()
+
+
+def test_checkout_strips_x_files_from_local_deploy_but_preserves_stored_compose(monkeypatch):
+    enriched = yaml.dump(
+        {
+            "services": {"api": {"image": "busybox"}},
+            "x-files": [{"path": "compose.yml", "content": base64.b64encode(b"raw").decode("utf-8")}],
+        },
+        sort_keys=False,
+    )
+
+    def fake_cli_run(command, **_kwargs):
+        if command[:3] == ["docker", "config", "inspect"]:
+            return json.dumps([{"Spec": {"Data": base64.b64encode(enriched.encode("utf-8")).decode("utf-8")}}])
+        raise AssertionError(f"Unexpected command: {command}")
+
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("docker_stack.cli.run_cli_command", fake_cli_run)
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", lambda *_args, **_kwargs: "")
+
+    docker = Docker()
+    docker.stack.checkout("team-a", "2")
+
+    assert docker.stack.commands[0].stdin == enriched
+    deploy = docker.stack.commands[-1]
+    assert deploy.command == ["docker", "stack", "deploy", "-c", "-", "team-a"]
+    assert yaml.safe_load(deploy.stdin) == {"services": {"api": {"image": "busybox"}}}
 
 
 def test_login_accepts_context_alias_and_positional_manager(monkeypatch, capsys):
@@ -489,6 +723,72 @@ def test_login_prefers_existing_context_for_portless_target(monkeypatch, capsys)
     assert "DOCKER_CONTEXT=office" in output
 
 
+def test_login_inside_shell_updates_existing_isolated_config(monkeypatch, tmp_path, capsys):
+    captured = {}
+
+    def fake_resolve_login_config(**kwargs):
+        captured["resolve"] = kwargs
+        return SimpleNamespace(
+            manager_url="https://172.31.0.6:2378",
+            context_name="office",
+            docker_context_host="tcp://172.31.0.6:2378",
+            skip_tls_verify=True,
+        )
+
+    def fake_ensure_isolated_login(config, docker_config_dir=None):
+        captured["ensure"] = {
+            "context_name": config.context_name,
+            "docker_config_dir": docker_config_dir,
+        }
+        return docker_config_dir, SimpleNamespace(
+            redirect_uri="http://localhost:8079/auth/callback",
+            expires_at=None,
+        )
+
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    monkeypatch.setenv("DOCKER_CONTEXT", "office")
+    monkeypatch.setattr("docker_stack.cli.resolve_login_config", fake_resolve_login_config)
+    monkeypatch.setattr("docker_stack.cli.ensure_isolated_login", fake_ensure_isolated_login)
+    monkeypatch.setattr(
+        "docker_stack.cli.docker_manager_login",
+        lambda _config: pytest.fail("login inside shell should not write global Docker config"),
+    )
+
+    main(["login"])
+
+    assert captured["ensure"] == {
+        "context_name": "office",
+        "docker_config_dir": tmp_path,
+    }
+    output = capsys.readouterr().out
+    assert f"DOCKER_CONFIG={tmp_path}" in output
+    assert "DOCKER_CONTEXT=office" in output
+
+
+def test_login_inside_shell_reports_active_token(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    monkeypatch.setenv("DOCKER_CONTEXT", "office")
+    monkeypatch.setattr(
+        "docker_stack.cli.resolve_login_config",
+        lambda **_kwargs: SimpleNamespace(
+            manager_url="https://172.31.0.6:2378",
+            context_name="office",
+            docker_context_host="tcp://172.31.0.6:2378",
+            skip_tls_verify=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "docker_stack.cli.ensure_isolated_login",
+        lambda _config, docker_config_dir=None: (docker_config_dir, None),
+    )
+
+    main(["login"])
+
+    output = capsys.readouterr().out
+    assert "Docker-Manager login already active." in output
+    assert f"DOCKER_CONFIG={tmp_path}" in output
+
+
 def test_shell_reuses_named_context_and_opens_isolated_bash(monkeypatch, capsys):
     captured = {}
 
@@ -522,8 +822,73 @@ def test_shell_reuses_named_context_and_opens_isolated_bash(monkeypatch, capsys)
     assert captured["manager_target"] is None
     assert captured["context_name"] is None
     output = capsys.readouterr().out
-    assert "Shell context=office" in output
+    assert "Opening shell context=office" in output
     assert "Access token already active." in output
+
+
+def test_shell_inside_same_context_reports_refreshing_current_shell(monkeypatch, tmp_path, capsys):
+    def fake_resolve_shell_login_config(**_kwargs):
+        return SimpleNamespace(
+            manager_url="https://172.31.0.6:2378",
+            context_name="office",
+            docker_context_host="tcp://172.31.0.6:2378",
+            skip_tls_verify=True,
+        )
+
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    monkeypatch.setenv("DOCKER_CONTEXT", "office")
+    monkeypatch.setattr("docker_stack.cli.resolve_shell_login_config", fake_resolve_shell_login_config)
+    monkeypatch.setattr(
+        "docker_stack.cli.ensure_isolated_login",
+        lambda _config: (
+            tmp_path,
+            SimpleNamespace(
+                redirect_uri="http://localhost:8079/auth/callback",
+                expires_at=None,
+            ),
+        ),
+    )
+    monkeypatch.setattr("docker_stack.cli.open_context_shell", lambda _config_dir, _context_name: 0)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["shell", "office"])
+
+    assert excinfo.value.code == 0
+    output = capsys.readouterr().out
+    assert "Refreshing current shell context=office" in output
+    assert f"DOCKER_CONFIG={tmp_path}" in output
+
+
+def test_open_context_shell_clears_endpoint_overrides(monkeypatch, tmp_path):
+    captured = {}
+    for key in DOCKER_SHELL_ENDPOINT_ENV_VARS:
+        monkeypatch.setenv(key, f"parent-{key}")
+    monkeypatch.setenv("SHELL", "/bin/test-shell")
+
+    def fake_run(cmd, check, env):
+        captured["cmd"] = cmd
+        captured["check"] = check
+        captured["env"] = env
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("docker_stack.cli.subprocess.run", fake_run)
+
+    assert open_context_shell(tmp_path, "office") == 0
+
+    assert captured["cmd"] == ["/bin/test-shell", "-i"]
+    assert captured["check"] is False
+    assert captured["env"]["DOCKER_CONFIG"] == str(tmp_path)
+    assert captured["env"]["DOCKER_CONTEXT"] == "office"
+    for key in DOCKER_SHELL_ENDPOINT_ENV_VARS:
+        assert key not in captured["env"]
+
+
+def test_active_shell_config_dir_requires_matching_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    monkeypatch.setenv("DOCKER_CONTEXT", "office")
+
+    assert active_shell_config_dir("office") == tmp_path
+    assert active_shell_config_dir("other") is None
 
 
 def test_setup_auth_uses_access_token_and_prints_machine_readable_exports(monkeypatch, capsys):

@@ -1,6 +1,12 @@
 import pytest
+import json
 
-from docker_stack.manager_api import FEATURE_STACK_DEPLOY, ManagerApiClient
+from docker_stack.manager_api import (
+    FEATURE_MESUDIP_DOCKER_ENTERPRISE,
+    FEATURE_STACK_DEPLOY,
+    FEATURE_STACK_QUERY,
+    ManagerApiClient,
+)
 
 
 def test_supports_stack_deploy_without_endpoint_catalog(monkeypatch):
@@ -10,12 +16,13 @@ def test_supports_stack_deploy_without_endpoint_catalog(monkeypatch):
     def fake_request(path, *, method="GET", payload=None):
         calls.append((method, path, payload))
         if path == "/version":
-            return {"MesudipFeatures": [FEATURE_STACK_DEPLOY]}
+            return {"MesudipFeatures": [FEATURE_MESUDIP_DOCKER_ENTERPRISE]}
         raise AssertionError(f"unexpected request: {method} {path}")
 
     monkeypatch.setattr(client, "_request_json", fake_request)
 
     assert client.supports(FEATURE_STACK_DEPLOY) is True
+    assert client.supports(FEATURE_STACK_QUERY) is True
     assert calls == [("GET", "/version", None)]
 
 
@@ -47,6 +54,135 @@ def test_deploy_stack_uses_direct_stack_api(monkeypatch):
                 "compose": "services: {}",
             },
         )
+    ]
+
+
+def test_deploy_stack_sends_only_matching_registry_auth(monkeypatch, tmp_path):
+    docker_config = tmp_path / "config.json"
+    docker_config.write_text(
+        json.dumps(
+            {
+                "auths": {
+                    "registry.sireto.io": {"auth": "sireto-token"},
+                    "registry.other.example": {"auth": "other-token"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
+    calls = []
+
+    def fake_request(path, *, method="GET", payload=None):
+        calls.append((method, path, payload))
+        return {"warnings": []}
+
+    monkeypatch.setattr(client, "_request_json", fake_request)
+
+    client.deploy_stack(
+        stack="govtool-preview",
+        namespace="default",
+        compose="services:\n  backend:\n    image: registry.sireto.io/govtool/backend:abc\n",
+        options={"with_registry_auth": True},
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/api/stacks/deploy",
+            {
+                "stack": "govtool-preview",
+                "namespace": "default",
+                "compose": "services:\n  backend:\n    image: registry.sireto.io/govtool/backend:abc\n",
+                "options": {
+                    "with_registry_auth": True,
+                    "registry_auth": {"registry.sireto.io": {"auth": "sireto-token"}},
+                },
+            },
+        )
+    ]
+
+
+def test_deploy_stack_uses_creds_store_when_auth_entry_is_empty(monkeypatch, tmp_path):
+    docker_config = tmp_path / "config.json"
+    docker_config.write_text(
+        json.dumps(
+            {
+                "auths": {"registry.sireto.io": {}},
+                "credsStore": "teststore",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    monkeypatch.setattr(
+        "docker_stack.manager_api._credential_helper_auth",
+        lambda server, helper: (
+            {"serveraddress": server, "username": "sudip", "password": "secret"}
+            if server == "registry.sireto.io" and helper == "teststore"
+            else None
+        ),
+    )
+    client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
+    calls = []
+
+    def fake_request(path, *, method="GET", payload=None):
+        calls.append((method, path, payload))
+        return {"warnings": []}
+
+    monkeypatch.setattr(client, "_request_json", fake_request)
+
+    client.deploy_stack(
+        stack="govtool-preview",
+        namespace="default",
+        compose="services:\n  backend:\n    image: registry.sireto.io/govtool/backend:abc\n",
+        options={"with_registry_auth": True},
+    )
+
+    assert calls[0][2]["options"]["registry_auth"] == {
+        "registry.sireto.io": {
+            "serveraddress": "registry.sireto.io",
+            "username": "sudip",
+            "password": "secret",
+        }
+    }
+
+
+def test_enterprise_query_uses_direct_manager_fast_paths(monkeypatch):
+    client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
+    calls = []
+
+    def fake_request(path, *, method="GET", payload=None):
+        calls.append((method, path, payload))
+        if path == "/version":
+            return {"MesudipFeatures": [FEATURE_MESUDIP_DOCKER_ENTERPRISE]}
+        if path == "/api/docker-stack/stacks":
+            return {"stacks": []}
+        if path == "/api/docker-stack/stacks/team-a/versions?namespace=prod":
+            return {"versions": []}
+        if path == "/api/docker-stack/stacks/team-a/compose?namespace=prod&tag=latest":
+            return {"compose": "services: {}"}
+        if path == "/api/docker-stack/nodes":
+            return {"nodes": []}
+        if path == "/api/stacks/team-a/rollback":
+            return {"warnings": []}
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setattr(client, "_request_json", fake_request)
+
+    assert client.list_stacks() == {"stacks": []}
+    assert client.list_stack_versions("team-a", namespace="prod") == {"versions": []}
+    assert client.get_stack_compose("team-a", namespace="prod", tag="latest") == {"compose": "services: {}"}
+    assert client.list_nodes() == {"nodes": []}
+    assert client.rollback_stack(stack="team-a", namespace="prod", version="2") == {"warnings": []}
+    assert calls == [
+        ("GET", "/version", None),
+        ("GET", "/api/docker-stack/stacks", None),
+        ("GET", "/api/docker-stack/stacks/team-a/versions?namespace=prod", None),
+        ("GET", "/api/docker-stack/stacks/team-a/compose?namespace=prod&tag=latest", None),
+        ("GET", "/api/docker-stack/nodes", None),
+        ("POST", "/api/stacks/team-a/rollback", {"namespace": "prod", "version": "2"}),
     ]
 
 

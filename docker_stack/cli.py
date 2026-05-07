@@ -33,6 +33,15 @@ from docker_stack.registry import DockerRegistry
 from .envsubst import LineCheckResult, SubstitutionError, envsubst, envsubst_load_file
 
 
+DOCKER_SHELL_ENDPOINT_ENV_VARS = (
+    "DOCKER_HOST",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "DOCKER_API_VERSION",
+    "DOCKER_MACHINE_NAME",
+)
+
+
 @dataclass
 class EnvFileEntry:
     key: str
@@ -41,6 +50,12 @@ class EnvFileEntry:
     line_content: str
     value_start_index: int
     value_inner_offset: int
+
+
+@dataclass
+class RenderedCompose:
+    clean: str
+    enriched: str
 
 
 class EnvFileResolutionError(Exception):
@@ -255,30 +270,127 @@ class DockerStack:
         with open(compose_file) as f:
             return self.decode_yaml(f.read())
 
-    def rendered_compose_file(self, compose_file, stack=None, include_build=True) -> str:
-        with open(compose_file) as f:
-            template_content = f.read()
+    @staticmethod
+    def _b64_content(content: bytes) -> str:
+        return base64.b64encode(content).decode("utf-8")
+
+    @staticmethod
+    def _strip_source_metadata(compose_content: str) -> str:
+        compose_data = yaml.safe_load(compose_content) or {}
+        if isinstance(compose_data, dict):
+            compose_data.pop("x-files", None)
+        return yaml.dump(compose_data, sort_keys=False)
+
+    @staticmethod
+    def _iter_env_refs(value: str):
+        for match in ENV_VAR_PATTERN.finditer(value):
+            name = match.group(1) if match.group(1) is not None else match.group(3)
+            default = match.group(2) if match.group(1) is not None else None
+            yield name, default
+
+    @staticmethod
+    def _secret_environment_vars(compose_data: dict) -> set:
+        secret_env_vars = set()
+        secrets = compose_data.get("secrets", {})
+        if not isinstance(secrets, dict):
+            return secret_env_vars
+        for details in secrets.values():
+            if isinstance(details, dict) and "environment" in details:
+                env_name = str(details["environment"]).strip()
+                if env_name:
+                    secret_env_vars.add(env_name)
+        return secret_env_vars
+
+    @staticmethod
+    def _relative_source_name(path: Path, base_dir: Path) -> str:
+        return os.path.relpath(path, base_dir).replace(os.sep, "/")
+
+    def _build_env_xfile(self, sources: List[str], excluded_names: set) -> Optional[Dict[str, str]]:
+        seen = set()
+        lines = []
+        for source in sources:
+            for name, default in self._iter_env_refs(source):
+                if name in seen or name in excluded_names:
+                    continue
+                value = os.environ.get(name)
+                if value in (None, "") and default is not None:
+                    value = default
+                if value in (None, ""):
+                    continue
+                seen.add(name)
+                lines.append(f"{name}={value}")
+        if not lines:
+            return None
+        content = ("\n".join(lines) + "\n").encode("utf-8")
+        return {"path": ".env", "content": self._b64_content(content)}
+
+    def _collect_config_source_files(self, compose_data: dict, base_dir: Path) -> Tuple[List[Dict[str, str]], List[str]]:
+        x_files = []
+        env_sources = []
+        configs = compose_data.get("configs", {})
+        if not isinstance(configs, dict):
+            return x_files, env_sources
+
+        for details in configs.values():
+            if not isinstance(details, dict):
+                continue
+            source_path = details.get("x-template-file", details.get("file"))
+            if not source_path:
+                continue
+            filename = (base_dir / source_path).resolve()
+            content = filename.read_bytes()
+            x_files.append(
+                {
+                    "path": self._relative_source_name(filename, base_dir),
+                    "content": self._b64_content(content),
+                }
+            )
+            env_sources.append(content.decode("utf-8", errors="ignore"))
+        return x_files, env_sources
+
+    def rendered_compose_file(self, compose_file, stack=None, include_build=True) -> RenderedCompose:
+        compose_path = Path(compose_file).resolve()
+        template_bytes = compose_path.read_bytes()
+        template_content = template_bytes.decode("utf-8")
         # Parse the YAML content
         compose_data = self.decode_yaml(template_content)
+        base_dir = compose_path.parent
+        source_x_files: List[Dict[str, str]] = []
+        env_sources = [template_content]
+        secret_env_vars = self._secret_environment_vars(compose_data)
+        if stack:
+            source_x_files, config_env_sources = self._collect_config_source_files(compose_data, base_dir)
+            env_sources.extend(config_env_sources)
         if not include_build:
             services: dict = compose_data.get("services", {})
             for k, v in services.items():
                 if "build" in v:
                     del v["build"]
         if stack:
-            base_dir = os.path.dirname(os.path.abspath(compose_file))
             if "configs" in compose_data:
                 compose_data["configs"] = self._process_x_content(
-                    compose_data["configs"], self.docker.config, base_dir=base_dir, stack=stack
+                    compose_data["configs"], self.docker.config, base_dir=str(base_dir), stack=stack
                 )
             if "secrets" in compose_data:
                 compose_data["secrets"] = self._process_x_content(
-                    compose_data["secrets"], self.docker.secret, base_dir=base_dir, stack=stack
+                    compose_data["secrets"], self.docker.secret, base_dir=str(base_dir), stack=stack
                 )
 
         # Define the replacements for '$' to '$$' for env variables in compose files
         replacements_map = {"$": "$$"}
-        return envsubst(yaml.dump(compose_data, sort_keys=False), replacements=replacements_map)
+        clean_content = envsubst(yaml.dump(compose_data, sort_keys=False), replacements=replacements_map)
+        enriched_data = yaml.safe_load(clean_content) or {}
+        x_files = [
+            {"path": "compose.yml", "content": self._b64_content(template_bytes)},
+        ]
+        env_xfile = self._build_env_xfile(env_sources, secret_env_vars)
+        if env_xfile:
+            x_files.append(env_xfile)
+        x_files.extend(source_x_files)
+        if isinstance(enriched_data, dict):
+            enriched_data["x-files"] = x_files
+        enriched_content = yaml.dump(enriched_data, sort_keys=False)
+        return RenderedCompose(clean=clean_content, enriched=enriched_content)
 
     def decode_yaml(self, data: str) -> dict:
         return yaml.safe_load(data)
@@ -287,15 +399,7 @@ class DockerStack:
         """
         Render the Docker Compose file with environment variables and create Docker configs/secrets.
         """
-
-        # Convert the modified data back to YAML
-        rendered_content = self.rendered_compose_file(compose_file, stack, include_build=include_build)
-
-        # Write the rendered file
-        rendered_filename = Path(compose_file).with_name(f"{Path(compose_file).stem}-rendered{Path(compose_file).suffix}")
-        with open(rendered_filename, "w") as f:
-            f.write(rendered_content)
-        return (rendered_filename, rendered_content)
+        return self.rendered_compose_file(compose_file, stack, include_build=include_build)
 
     def _process_x_content(self, objects, manager: DockerObjectManager, base_dir="", stack=None):
         """
@@ -366,7 +470,7 @@ class DockerStack:
             if isinstance(details, dict) and "x-content" in details:
                 add_obj(name, details["x-content"], explicit_name=explicit_name)
             elif isinstance(details, dict) and "x-template" in details:
-                add_obj(name, envsubst(details["x-content"], os.environ), explicit_name=explicit_name)
+                add_obj(name, envsubst(details["x-template"], os.environ), explicit_name=explicit_name)
             elif isinstance(details, dict) and "x-template-file" in details:
                 filename = os.path.join(base_dir, details["x-template-file"])
                 add_obj(name, envsubst_load_file(filename, os.environ), explicit_name=explicit_name)
@@ -374,8 +478,17 @@ class DockerStack:
                 filename = os.path.join(base_dir, details["file"])
                 with open(filename) as file:
                     add_obj(name, file.read(), explicit_name=explicit_name)
-            elif isinstance(details, dict) and "x-generate" in details and manager.object_type == "secret":
-                generate_options = details["x-generate"]
+            elif isinstance(details, dict) and manager.object_type == "secret" and "environment" in details:
+                env_name = str(details["environment"]).strip()
+                env_value = os.environ.get(env_name)
+                if env_value in (None, ""):
+                    raise ValueError(f"Secret {name} references environment variable {env_name}, but it is not set.")
+                add_obj(name, env_value, explicit_name=explicit_name)
+            elif isinstance(details, dict) and manager.object_type == "secret" and (
+                "x-generate" in details or "x-generated" in details
+            ):
+                # Support both spellings for compatibility.
+                generate_options = details.get("x-generate", details.get("x-generated"))
                 if isinstance(generate_options, bool) and generate_options:
                     if manager_client and stack:
                         add_obj(name, "", explicit_name=explicit_name, is_generated_secret=True, generate_options={})
@@ -645,15 +758,12 @@ class DockerStack:
                 version = matching_versions[0]
             compose_content = self.cat(stack_name, version, namespace=namespace)
 
-        temp_file = f"/tmp/{stack_name}_v{version}.yml"
-        with open(temp_file, "w") as f:
-            f.write(compose_content)
-
+        deploy_content = self._strip_source_metadata(compose_content)
         print(f"Deploying stack {stack_name} with version {version} (tag: {tag})...")
         self._deploy(
             stack_name,
-            temp_file,
-            compose_content,
+            deploy_content,
+            stored_content=compose_content,
             with_registry_auth=with_registry_auth,
             tag=tag,
             namespace=namespace,
@@ -663,13 +773,14 @@ class DockerStack:
     def _deploy(
         self,
         stack_name,
-        rendered_filename,
         rendered_content,
+        stored_content=None,
         with_registry_auth=False,
         tag=None,
         namespace: str = "default",
         dry_run: bool = False,
     ):
+        stored_content = stored_content if stored_content is not None else rendered_content
         labels = [
             f"mesudip.stack.name={stack_name}",
             f"com.mesudip.namespace={namespace}",
@@ -679,19 +790,21 @@ class DockerStack:
             labels.append(f"mesudip.stack.tag={tag}")
 
         manager_deploy = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
-        if manager_deploy and not with_registry_auth and dry_run:
+        manager_options = {"with_registry_auth": with_registry_auth} if with_registry_auth else {}
+        if manager_deploy and dry_run:
             self._validate_via_manager(
                 manager_deploy,
                 stack_name=stack_name,
                 namespace=namespace,
-                rendered_content=rendered_content,
+                rendered_content=stored_content,
+                options=manager_options,
             )
             return
 
         # Manager-backed deploys must stay on the manager stack APIs. Hitting
         # direct daemon config endpoints here breaks GitHub OIDC workflows,
         # which are intentionally restricted away from generic daemon access.
-        if manager_deploy and not with_registry_auth:
+        if manager_deploy:
             self.commands.append(
                 CallbackCommand(
                     f"docker-manager stack deploy {stack_name}",
@@ -699,20 +812,21 @@ class DockerStack:
                         manager_deploy,
                         stack_name=stack_name,
                         namespace=namespace,
-                        rendered_content=rendered_content,
+                        rendered_content=stored_content,
+                        options=manager_options,
                     ),
                 )
             )
             return
 
-        _, cmd = self.docker.config.increment(stack_name, rendered_content, labels=labels, stack=stack_name)
+        _, cmd = self.docker.config.increment(stack_name, stored_content, labels=labels, stack=stack_name)
         if not cmd.isNop():
             self.commands.append(cmd)
 
-        cmd = ["docker", "stack", "deploy", "-c", str(rendered_filename), stack_name]
+        cmd = ["docker", "stack", "deploy", "-c", "-", stack_name]
         if with_registry_auth:
             cmd.insert(3, "--with-registry-auth")
-        self.commands.append(Command(cmd, give_console=True))
+        self.commands.append(Command(cmd, stdin=rendered_content, give_console=True))
 
     @staticmethod
     def _validate_via_manager(
@@ -721,12 +835,13 @@ class DockerStack:
         stack_name: str,
         namespace: str,
         rendered_content: str,
+        options: Dict[str, object],
     ) -> Optional[str]:
         payload = manager_client.validate_stack(
             stack=stack_name,
             namespace=namespace,
             compose=rendered_content,
-            options={},
+            options=options,
         )
         warnings = payload.get("warnings") or []
         for warning in warnings:
@@ -748,12 +863,13 @@ class DockerStack:
         stack_name: str,
         namespace: str,
         rendered_content: str,
+        options: Dict[str, object],
     ) -> Optional[str]:
         payload = manager_client.deploy_stack(
             stack=stack_name,
             namespace=namespace,
             compose=rendered_content,
-            options={},
+            options=options,
         )
         warnings = payload.get("warnings") or []
         for warning in warnings:
@@ -801,11 +917,11 @@ class DockerStack:
         dry_run: bool = False,
     ):
         self.generated_secrets = {}  # Reset for each deployment
-        rendered_filename, rendered_content = self.render_compose_file(compose_file, stack=stack_name, include_build=False)
+        rendered = self.render_compose_file(compose_file, stack=stack_name, include_build=False)
         self._deploy(
             stack_name,
-            rendered_filename,
-            rendered_content,
+            rendered.clean,
+            stored_content=rendered.enriched,
             with_registry_auth=with_registry_auth,
             tag=tag,
             namespace=namespace,
@@ -991,10 +1107,20 @@ class DockerNode:
 
 def open_context_shell(config_dir: Path, context_name: str) -> int:
     env = dict(os.environ)
+    for key in DOCKER_SHELL_ENDPOINT_ENV_VARS:
+        env.pop(key, None)
     env["DOCKER_CONFIG"] = str(config_dir)
     env["DOCKER_CONTEXT"] = context_name
     shell = env.get("SHELL", "").strip() or "/bin/bash"
     return subprocess.run([shell, "-i"], check=False, env=env).returncode
+
+
+def active_shell_config_dir(context_name: str) -> Optional[Path]:
+    docker_config = os.getenv("DOCKER_CONFIG", "").strip()
+    docker_context = os.getenv("DOCKER_CONTEXT", "").strip()
+    if not docker_config or docker_context != context_name:
+        return None
+    return Path(docker_config)
 
 
 def main(args: List[str] = None):
@@ -1101,19 +1227,30 @@ def main(args: List[str] = None):
                 context_name=args.context_name,
                 timeout_secs=args.timeout_secs,
             )
-            result = docker_manager_login(config)
+            current_shell_config = active_shell_config_dir(config.context_name)
+            if current_shell_config:
+                config_dir, result = ensure_isolated_login(config, docker_config_dir=current_shell_config)
+            else:
+                config_dir = None
+                result = docker_manager_login(config)
         except RuntimeError as exc:
             print(f"docker-stack login: {exc}", file=sys.stderr)
             sys.exit(2)
-        print("Docker-Manager browser login successful.")
-        print(f"Callback: {result.redirect_uri}")
+        if result is None:
+            print("Docker-Manager login already active.")
+        else:
+            print("Docker-Manager browser login successful.")
+            print(f"Callback: {result.redirect_uri}")
         print(f"DOCKER_CONTEXT={config.context_name}")
+        if config_dir is not None:
+            print(f"DOCKER_CONFIG={config_dir}")
         print(f"Context host={config.docker_context_host}")
         if config.manager_url.startswith("https://"):
             print(f"TLS detected for manager endpoint ({'verification skipped' if config.skip_tls_verify else 'verified'})")
-        expiry = format_expiry(result.expires_at)
-        if expiry:
-            print(f"Access token expires in {expiry}")
+        if result is not None:
+            expiry = format_expiry(result.expires_at)
+            if expiry:
+                print(f"Access token expires in {expiry}")
         print("Try: docker ps")
         return
 
@@ -1127,11 +1264,15 @@ def main(args: List[str] = None):
                 context_name=args.context_name,
                 timeout_secs=args.timeout_secs,
             )
+            existing_shell_config = active_shell_config_dir(config.context_name)
             config_dir, result = ensure_isolated_login(config)
         except RuntimeError as exc:
             print(f"docker-stack shell: {exc}", file=sys.stderr)
             sys.exit(2)
-        print(f"Shell context={config.context_name}")
+        if existing_shell_config:
+            print(f"Refreshing current shell context={config.context_name}")
+        else:
+            print(f"Opening shell context={config.context_name}")
         print(f"Shell manager={config.manager_url}")
         print(f"DOCKER_CONFIG={config_dir}")
         if result is not None:

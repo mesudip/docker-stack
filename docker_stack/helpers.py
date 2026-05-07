@@ -148,6 +148,19 @@ class Command:
             if result.returncode != 0:
                 sys.exit(result.returncode)
         else:
+            if self.give_console:
+                result = run_command(
+                    self.command,
+                    stdin=self.stdin,
+                    raise_error=False,
+                    log=False,
+                    interactive=True,
+                    cwd=self.cwd,
+                    capture_output=False,
+                )
+                if result.returncode != 0:
+                    sys.exit(result.returncode)
+                return None
             return run_cli_command(self.command, stdin=self.stdin, log=False, shell=False, cwd=self.cwd)
 
     def __str__(self) -> str:
@@ -158,6 +171,8 @@ class Command:
             A string representation of the command, including stdin if applicable.
         """
         if self.stdin:
+            if "\n" in self.stdin or len(self.stdin) > 120:
+                return f"<stdin> | {' '.join(self.command)}"
             return f"echo '{self.stdin}' | {' '.join(self.command)}"
         elif self.command:
             return " ".join(self.command)

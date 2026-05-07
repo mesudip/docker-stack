@@ -691,11 +691,45 @@ def switch_docker_context(context_name: str) -> bool:
     return manager_context
 
 
+def _session_needs_manual_callback() -> bool:
+    if os.getenv("DOCKER_STACK_MANUAL_LOGIN", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    if os.getenv("SSH_TTY") or os.getenv("SSH_CONNECTION"):
+        return True
+    return not bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY") or os.getenv("BROWSER"))
+
+
+def _read_manual_callback_url() -> Optional[str]:
+    print(
+        "After login, paste the full callback URL here if the browser cannot reach localhost "
+        "on this machine."
+    )
+    try:
+        callback_url = input("Callback URL: ").strip()
+    except EOFError:
+        return None
+    return callback_url or None
+
+
+def _parse_callback_url(callback_url: str) -> Dict[str, Optional[str]]:
+    parsed = urllib.parse.urlparse(callback_url.strip())
+    query_string = parsed.query
+    if not query_string and callback_url.lstrip().startswith("?"):
+        query_string = callback_url.lstrip()[1:]
+    query = urllib.parse.parse_qs(query_string)
+    return {
+        "code": query.get("code", [None])[0],
+        "state": query.get("state", [None])[0],
+        "error": query.get("error", [None])[0],
+    }
+
+
 def browser_login(
     config: DockerManagerLoginConfig,
     *,
     port_finder: Callable[[], int] = find_callback_port,
     browser_opener: Callable[[str], bool] = webbrowser.open,
+    callback_reader: Callable[[], Optional[str]] = _read_manual_callback_url,
     urlopen: Callable = urllib.request.urlopen,
 ) -> DockerManagerLoginResult:
     callback_port = port_finder()
@@ -708,11 +742,7 @@ def browser_login(
 
     class CallbackHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            parsed = urllib.parse.urlparse(self.path)
-            query = urllib.parse.parse_qs(parsed.query)
-            result["code"] = query.get("code", [None])[0]
-            result["state"] = query.get("state", [None])[0]
-            result["error"] = query.get("error", [None])[0]
+            result.update(_parse_callback_url(self.path))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -730,7 +760,17 @@ def browser_login(
     thread.start()
 
     print(f"Open this URL if the browser does not launch:\n{auth_url}")
-    browser_opener(auth_url)
+    browser_opened = False
+    try:
+        browser_opened = bool(browser_opener(auth_url))
+    except webbrowser.Error:
+        browser_opened = False
+
+    if not browser_opened or _session_needs_manual_callback():
+        callback_url = callback_reader()
+        if callback_url:
+            result.update(_parse_callback_url(callback_url))
+            callback_event.set()
 
     try:
         if not callback_event.wait(timeout=config.timeout_secs):

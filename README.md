@@ -113,6 +113,23 @@ Vanilla Docker Stack deployments can sometimes lack the flexibility needed for d
     ```
     *(Content of `./templates/my_config.tpl` might be: `DB_HOST=${DATABASE_HOST}`)*
 
+    ### `environment`: Secret Content from Environment Variables
+    Secrets can read their content from an environment variable at deploy time.
+
+    ```yaml
+    secrets:
+      api_token:
+        environment: API_TOKEN
+    ```
+
+    If the variable is unset or empty, deployment fails before Docker objects are created.
+
+    ### Stored Source Metadata
+    Versioned stack configs include a top-level `x-files` list with base64-encoded source material for recovery and auditing. This includes the original compose file as `compose.yml`, a generated `.env` containing referenced non-secret environment values, and config files referenced by `configs.*.file` or `configs.*.x-template-file`. Secret source files and variables used by `secrets.*.environment` are not stored in `x-files`.
+
+    ### Known Issues
+    Stored `x-files` metadata is written into Docker configs during local deploys. Docker config content is limited to 500 KB, and base64-encoded source files add roughly 33% overhead, so stacks with large compose/config source files can exceed the Docker config payload limit even when the rendered compose is valid.
+
     ### `x-generate`: Dynamic Secret Generation (Secrets Only)
     This powerful feature allows you to automatically generate random secrets based on specified criteria, eliminating the need to manually create and manage them. This is particularly useful for passwords, API keys, and other sensitive data.
 

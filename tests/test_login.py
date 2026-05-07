@@ -555,3 +555,49 @@ def test_browser_login_handles_callback_and_token_exchange(monkeypatch):
     assert result.callback_port > 0
     assert result.access_token == "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"
     assert result.expires_at == 1900000000
+
+
+def test_browser_login_accepts_pasted_callback_when_browser_unavailable(monkeypatch):
+    config = DockerManagerLoginConfig(
+        manager_url="http://localhost:8080",
+        context_name="office",
+        timeout_secs=5,
+        skip_tls_verify=False,
+    )
+    captured = {}
+
+    def fake_build_auth_url(login_config, redirect_uri, state):
+        captured["callback_url"] = f"{redirect_uri}?code=manual-code&state={state}"
+        return (
+            "https://keycloak.example.com/realms/master/protocol/openid-connect/auth?"
+            + urllib.parse.urlencode({"redirect_uri": redirect_uri, "state": state})
+        )
+
+    def fake_exchange(login_config, code, redirect_uri, **kwargs):
+        assert code == "manual-code"
+        assert redirect_uri.endswith("/auth/callback")
+        return {
+            "access_token": "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"
+        }
+
+    def port_finder():
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return port
+
+    monkeypatch.setattr("docker_stack.login.build_auth_url", fake_build_auth_url)
+    monkeypatch.setattr("docker_stack.login.exchange_authorization_code", fake_exchange)
+
+    result = browser_login(
+        config,
+        browser_opener=lambda auth_url: False,
+        callback_reader=lambda: captured["callback_url"],
+        port_finder=port_finder,
+    )
+
+    assert result.redirect_uri.endswith("/auth/callback")
+    assert result.callback_port > 0
+    assert result.access_token == "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"
+    assert result.expires_at == 1900000000

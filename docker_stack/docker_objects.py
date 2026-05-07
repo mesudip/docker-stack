@@ -4,6 +4,7 @@ import re
 import json
 from typing import Dict, List, Tuple, Optional
 from docker_stack.helpers import Command, run_cli_command  # Import the helper function
+from docker_stack.command_runner import run_command
 
 
 class DockerObjectManager:
@@ -33,18 +34,26 @@ class DockerObjectManager:
 
     def check(self, object_name):
         command = ["docker", self.object_type, "inspect", object_name]
-
-        try:
-            # Use run_cli_command instead of subprocess.run
-            run_cli_command(command, raise_error=True, log=self.log)
-            return True
-        except Exception:
-            return False
+        result = run_command(
+            command,
+            raise_error=False,
+            log=self.log,
+            capture_output=True,
+        )
+        return result.returncode == 0
 
     def create(self, object_name, object_content, labels: List[str] = [], stack=None) -> Tuple[str, Command]:
         sha_hash = self.calculate_hash(object_name, object_content)
         if stack:
             labels = labels + ["com.docker.stack.namespace=" + stack]
+
+        def labels_from_object_info(object_info: Dict) -> Dict[str, str]:
+            raw_labels = object_info.get("Labels")
+            if isinstance(raw_labels, dict):
+                return raw_labels
+            if isinstance(raw_labels, str):
+                return parse_labels(raw_labels)
+            return {}
 
         # Check if any version of the object already exists by its label
         command = [
@@ -77,13 +86,30 @@ class DockerObjectManager:
                 last_object_info = object_info
             existing_versions[current_version] = object_info
 
+        # Fallback for unmanaged pre-existing object with the same name but without
+        # mesudip labels. This keeps create() idempotent across legacy/manual objects.
+        if max_version == 0 and self.check(object_name):
+            inspect_labels_cmd = [
+                "docker",
+                self.object_type,
+                "inspect",
+                object_name,
+                "--format",
+                "{{json .Spec.Labels}}",
+            ]
+            inspect_labels_output = run_cli_command(inspect_labels_cmd, raise_error=True, log=self.log)
+            inspect_labels = json.loads(inspect_labels_output) if inspect_labels_output and inspect_labels_output != "null" else {}
+            fallback_info = {"Name": object_name, "Labels": inspect_labels}
+            max_version = 1
+            last_object_info = fallback_info
+            existing_versions[1] = fallback_info
+
         # Determine if the new object has the 'generated' flag
         new_object_is_generated = "mesudip.secret.generated=true" in labels
 
         if max_version > 0 and self.object_type == "secret":
             # Retrieve labels of the last existing object
-            last_object_labels_str = last_object_info["Labels"]
-            last_object_labels = parse_labels(last_object_labels_str)
+            last_object_labels = labels_from_object_info(last_object_info)
             last_object_is_generated = last_object_labels.get("mesudip.secret.generated") == "true"
 
             # Case 2: Generated -> Generated. If there is "generated" flag in the last latest version and this new create command also has "generated" flag, return the same old one
@@ -108,7 +134,7 @@ class DockerObjectManager:
         matching_object = None
 
         for object_info in existing_versions.values():
-            parsed_labels = parse_labels(object_info["Labels"])
+            parsed_labels = labels_from_object_info(object_info)
             object_sha_hash = parsed_labels.get("sha256")
 
             if object_sha_hash == sha_hash:

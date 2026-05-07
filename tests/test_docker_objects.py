@@ -44,3 +44,24 @@ def test_when_create_object_with_old_data___then_reuse_old_object():
     run_cli_command("docker config rm pytest_config_v2".split(" "))
     run_cli_command("docker secret rm pytest_secret".split(" "))
     run_cli_command("docker secret rm pytest_secret_v2".split(" "))
+
+
+def test_create_handles_unlabeled_existing_object_name(monkeypatch):
+    manager = DockerConfig(log=False)
+
+    def fake_run_cli_command(command, stdin=None, raise_error=True, log=True, shell=False, interactive=False, cwd=None):
+        if command[:3] == ["docker", "config", "ls"]:
+            return ""
+        if command[:3] == ["docker", "config", "inspect"] and "--format" not in command:
+            return '[{"ID":"abc","Spec":{"Name":"stack_config.json"}}]'
+        if command[:3] == ["docker", "config", "inspect"] and command[-1] == "{{json .Spec.Labels}}":
+            return "{}"
+        raise AssertionError(f"Unexpected command: {command}")
+
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", fake_run_cli_command)
+    monkeypatch.setattr(manager, "check", lambda _name: True)
+
+    object_name, command = manager.create("stack_config.json", "hello")
+    assert object_name == "stack_config.json_v2"
+    assert command.command[:4] == ["docker", "config", "create", "--label"]
+    assert command.command[-2:] == ["stack_config.json_v2", "-"]

@@ -2,32 +2,25 @@ import json
 import os
 import shutil
 import ssl
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
+import yaml
+
 from docker_stack.login import current_docker_context_target, resolve_login_config
 
+FEATURE_MESUDIP_DOCKER_ENTERPRISE = "mesudip-docker-enterprise-v1"
 FEATURE_STACK_QUERY = "docker_stack_query_v1"
 FEATURE_STACK_DEPLOY = "docker_stack_deploy_v1"
 DEFAULT_NAMESPACE = "default"
 
 
 def _docker_config_headers() -> Dict[str, str]:
-    config_root = os.getenv("DOCKER_CONFIG")
-    config_path = (
-        Path(config_root) / "config.json"
-        if config_root
-        else Path.home() / ".docker" / "config.json"
-    )
-    if not config_path.exists():
-        return {}
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+    payload = _read_docker_config()
     headers = payload.get("HttpHeaders")
     if not isinstance(headers, dict):
         return {}
@@ -36,6 +29,172 @@ def _docker_config_headers() -> Dict[str, str]:
         for key, value in headers.items()
         if isinstance(key, str) and isinstance(value, str) and key.strip() and value.strip()
     }
+
+
+def _docker_config_path() -> Path:
+    config_root = os.getenv("DOCKER_CONFIG")
+    return (
+        Path(config_root) / "config.json"
+        if config_root
+        else Path.home() / ".docker" / "config.json"
+    )
+
+
+def _read_docker_config() -> Dict[str, Any]:
+    config_path = _docker_config_path()
+    if not config_path.exists():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _credential_helper_auth(server: str, helper: str) -> Optional[Dict[str, str]]:
+    helper = helper.strip()
+    if not server.strip() or not helper:
+        return None
+    executable = f"docker-credential-{helper}"
+    if shutil.which(executable) is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "get"],
+            input=server,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    username = str(payload.get("Username") or "").strip()
+    secret = str(payload.get("Secret") or "").strip()
+    if not secret:
+        return None
+    auth: Dict[str, str] = {"serveraddress": server}
+    if username == "<token>":
+        auth["identitytoken"] = secret
+    elif username:
+        auth["username"] = username
+        auth["password"] = secret
+    else:
+        return None
+    return auth
+
+
+def _docker_config_registry_auths(registries: Set[str]) -> Dict[str, Dict[str, Any]]:
+    payload = _read_docker_config()
+    auths: Dict[str, Dict[str, Any]] = {}
+    raw_auths = payload.get("auths")
+    if isinstance(raw_auths, dict):
+        for server, auth in raw_auths.items():
+            if isinstance(server, str) and isinstance(auth, dict) and _registry_auth_matches(server, registries):
+                auths[server] = {
+                    str(key): value
+                    for key, value in auth.items()
+                    if isinstance(key, str) and value is not None
+                }
+
+    cred_helpers = payload.get("credHelpers")
+    if isinstance(cred_helpers, dict):
+        for server, helper in cred_helpers.items():
+            if not isinstance(server, str) or not isinstance(helper, str):
+                continue
+            if not _registry_auth_matches(server, registries):
+                continue
+            helper_auth = _credential_helper_auth(server, helper)
+            if helper_auth:
+                auths[server] = helper_auth
+
+    creds_store = payload.get("credsStore")
+    if isinstance(creds_store, str) and creds_store.strip():
+        for registry in sorted(registries):
+            for server in _docker_auth_server_candidates(registry):
+                if _has_registry_auth_material(auths.get(server)):
+                    continue
+                helper_auth = _credential_helper_auth(server, creds_store)
+                if helper_auth:
+                    auths[server] = helper_auth
+                    break
+
+    return {
+        server: auth
+        for server, auth in auths.items()
+        if _has_registry_auth_material(auth)
+    }
+
+
+def _has_registry_auth_material(auth: Optional[Dict[str, Any]]) -> bool:
+    if not auth:
+        return False
+    return bool(
+        auth.get("auth")
+        or auth.get("identitytoken")
+        or (auth.get("username") and auth.get("password"))
+    )
+
+
+def _image_registry(image: str) -> str:
+    image = image.split("@", 1)[0]
+    first = image.split("/", 1)[0]
+    if "." in first or ":" in first or first == "localhost":
+        return first
+    return "docker.io"
+
+
+def _compose_image_registries(compose: str) -> Set[str]:
+    try:
+        payload = yaml.safe_load(compose) or {}
+    except yaml.YAMLError:
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    services = payload.get("services")
+    if not isinstance(services, dict):
+        return set()
+    registries: Set[str] = set()
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        image = service.get("image")
+        if isinstance(image, str) and image.strip():
+            registries.add(_image_registry(image.strip()))
+    return registries
+
+
+def _docker_auth_server_candidates(registry: str) -> Set[str]:
+    if registry == "docker.io":
+        return {"docker.io", "registry-1.docker.io", "https://index.docker.io/v1/"}
+    return {registry, f"https://{registry}", f"http://{registry}"}
+
+
+def _registry_auth_matches(server: str, registries: Set[str]) -> bool:
+    return any(server in _docker_auth_server_candidates(registry) for registry in registries)
+
+
+def _with_registry_auth_options(options: Optional[Dict[str, Any]], compose: str) -> Dict[str, Any]:
+    prepared = dict(options or {})
+    if prepared.get("with_registry_auth"):
+        registries = _compose_image_registries(compose)
+        registry_auth = _docker_config_registry_auths(registries)
+        if registry_auth:
+            prepared["registry_auth"] = registry_auth
+    return prepared
+
+
+def _public_deploy_options(options: Optional[Dict[str, Any]], compose: str) -> Optional[Dict[str, Any]]:
+    prepared = _with_registry_auth_options(options, compose)
+    if not prepared:
+        return {}
+    return prepared
 
 
 def _manager_target_from_env() -> Optional[str]:
@@ -167,6 +326,7 @@ class ManagerApiClient:
 
         payload = self._request_json("/api/endpoints")
         endpoints = payload.get("endpoints")
+        # TODO: Support control-plane targets by carrying endpoint id/name in docker-stack requests.
         raise RuntimeError(
             "docker-stack does not support Docker-Manager control-plane targets. "
             "Point DOCKER_MANAGER_URL at a direct manager stack API instead. "
@@ -180,6 +340,11 @@ class ManagerApiClient:
 
     def supports(self, feature_name: str) -> bool:
         features = self.detect_features()
+        if FEATURE_MESUDIP_DOCKER_ENTERPRISE in features and feature_name in {
+            FEATURE_STACK_QUERY,
+            FEATURE_STACK_DEPLOY,
+        }:
+            return self._detect_manager_backend()
         if feature_name not in features:
             return False
         if feature_name == FEATURE_STACK_DEPLOY:
@@ -188,11 +353,17 @@ class ManagerApiClient:
         return True
 
     def list_stacks(self) -> Dict[str, Any]:
+        if self._detect_manager_backend():
+            return self._request_json("/api/docker-stack/stacks")
         return self._request_json(self._endpoint_path("/inventory/stacks"))
 
     def list_stack_versions(self, stack_name: str, *, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, Any]:
         stack = urllib.parse.quote(stack_name, safe="")
         query = urllib.parse.urlencode({"namespace": namespace})
+        if self._detect_manager_backend():
+            return self._request_json(
+                f"/api/docker-stack/stacks/{stack}/versions?{query}"
+            )
         return self._request_json(
             f"{self._endpoint_path(f'/inventory/stacks/{stack}/versions')}?{query}"
         )
@@ -212,11 +383,17 @@ class ManagerApiClient:
         if tag:
             params["tag"] = tag
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
+        if self._detect_manager_backend():
+            return self._request_json(
+                f"/api/docker-stack/stacks/{stack}/compose{query}"
+            )
         return self._request_json(
             f"{self._endpoint_path(f'/inventory/stacks/{stack}/compose')}{query}"
         )
 
     def list_nodes(self) -> Dict[str, Any]:
+        if self._detect_manager_backend():
+            return self._request_json("/api/docker-stack/nodes")
         payload = self._request_json(self._endpoint_path("/proxy/nodes"))
         if not isinstance(payload, list):
             raise RuntimeError("Docker-Manager nodes response is invalid")
@@ -338,8 +515,9 @@ class ManagerApiClient:
         options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"stack": stack, "namespace": namespace, "compose": compose}
-        if options:
-            payload["options"] = options
+        prepared_options = _public_deploy_options(options, compose)
+        if prepared_options:
+            payload["options"] = prepared_options
         return self._request_json(
             "/api/stacks/deploy",
             method="POST",
@@ -348,6 +526,12 @@ class ManagerApiClient:
 
     def rollback_stack(self, *, stack: str, namespace: str, version: str) -> Dict[str, Any]:
         quoted_stack = urllib.parse.quote(stack, safe="")
+        if self._detect_manager_backend():
+            return self._request_json(
+                f"/api/stacks/{quoted_stack}/rollback",
+                method="POST",
+                payload={"namespace": namespace, "version": version},
+            )
         return self._request_json(
             self._endpoint_path(f"/inventory/stacks/{quoted_stack}/rollback"),
             method="POST",
