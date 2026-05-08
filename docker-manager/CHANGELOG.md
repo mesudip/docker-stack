@@ -1,5 +1,27 @@
 # Docker-Manager Changelog
 
+## v2.1.0
+
+### Added
+
+- GitHub Actions support is now implemented as a Node.js action with setup and post-cleanup phases.
+- The action now exports `DOCKER_CONFIG`, `DOCKER_CONTEXT`, and `DOCKER_MANAGER_URL` for later workflow steps and removes its generated Docker config directory after the job.
+- Manager deploys now receive matching registry auth when `docker-stack deploy --with-registry-auth` is used, including credentials from Docker credential helpers.
+- Manager-backed versioned stack config now stores source metadata in `x-files` for compose/config recovery and audit workflows.
+
+### Changed
+
+- The GitHub Action defaults to the `dm-proxy` context when no context is provided.
+- Docker-Manager enterprise feature detection now enables direct stack query, node listing, compose retrieval, and rollback API paths.
+- Manager deploy validation and deploy requests now use the enriched stored compose for manager state while keeping deployment content clean of source metadata.
+- Isolated manager shells now clear inherited Docker endpoint override variables before opening the shell.
+
+### Fixed
+
+- Browser login can continue with a pasted callback URL when automatic localhost callback delivery is unavailable.
+- `docker-stack login` now handles already-active manager tokens without forcing a fresh browser login.
+- Switching or refreshing an already-active isolated manager shell now reuses the current Docker config directory.
+
 ## v2.0.0
 
 ### Added
