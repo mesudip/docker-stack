@@ -58,7 +58,7 @@ runs:
 
     - name: Setup auth
       id: setup
-      uses: mesudip/docker-stack/github-action@v2
+      uses: mesudip/docker-stack/.github/actions/setup-auth@v2
       with:
         manager: ${{ inputs.manager }}
         context: ${{ inputs.context }}
