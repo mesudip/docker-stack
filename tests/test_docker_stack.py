@@ -604,6 +604,31 @@ def test_deploy_restricted_raw_docker_error_is_actionable(monkeypatch, tmp_path,
     assert "Traceback" not in stderr
 
 
+def test_deploy_with_manager_url_fails_when_feature_not_advertised(monkeypatch, tmp_path, capsys):
+    fake_manager = FakeManagerClient()
+    fake_manager.features = set()
+    monkeypatch.setenv("DOCKER_MANAGER_URL", "https://manager.example.test:2378")
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    monkeypatch.setattr(
+        "docker_stack.docker_objects.run_cli_command",
+        lambda *args, **kwargs: pytest.fail("explicit manager mode must not fall back to raw Docker CLI"),
+    )
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  api:\n    image: busybox\n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["deploy", "team-a", str(compose_file)])
+
+    assert excinfo.value.code == 2
+    stderr = capsys.readouterr().err
+    assert (
+        "Docker-Manager is configured via DOCKER_MANAGER_URL, but /version did not advertise required feature docker_stack_deploy_v1"
+        in stderr
+    )
+    assert "Suggestion: deploy the current Docker-Manager server code" in stderr
+    assert "Traceback" not in stderr
+
+
 def test_manager_deploy_runtime_error_is_actionable(monkeypatch, tmp_path, capsys):
     class UntrustedWorkflowManager(FakeManagerClient):
         def deploy_stack(self, *, stack, namespace, compose, options=None):
@@ -623,6 +648,38 @@ def test_manager_deploy_runtime_error_is_actionable(monkeypatch, tmp_path, capsy
     stderr = capsys.readouterr().err
     assert "docker-stack: Manager request failed (POST /api/stacks/deploy): HTTP 403" in stderr
     assert "Suggestion: configure a trusted workflow/deployment rule" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_manager_deploy_external_network_scope_error_is_actionable(monkeypatch, tmp_path, capsys):
+    class ExternalNetworkScopeManager(FakeManagerClient):
+        def deploy_stack(self, *, stack, namespace, compose, options=None):
+            raise RuntimeError(
+                "Manager request failed (POST /api/stacks/deploy): HTTP 403: "
+                '{"message":"external network dbsync is outside the stack scope"}'
+            )
+
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: ExternalNetworkScopeManager())
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "networks:\n"
+        "  dbsync:\n"
+        "    external: true\n"
+        "services:\n"
+        "  api:\n"
+        "    image: busybox\n"
+        "    networks:\n"
+        "      - dbsync\n"
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["deploy", "team-a", str(compose_file)])
+
+    assert excinfo.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "external network dbsync is outside the stack scope" in stderr
+    assert "Suggestion: the compose file references an external Docker network" in stderr
+    assert "allow that external network in the Docker-Manager deployment rule" in stderr
     assert "Traceback" not in stderr
 
 

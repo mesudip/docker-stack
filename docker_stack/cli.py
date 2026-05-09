@@ -528,12 +528,22 @@ class DockerStack:
     def _manager_client_for_feature(self, feature_name: str) -> Optional[ManagerApiClient]:
         client = self.docker.manager_client()
         if not client:
+            if os.getenv("DOCKER_MANAGER_URL", "").strip():
+                raise RuntimeError(
+                    "Docker-Manager is configured via DOCKER_MANAGER_URL, but docker-stack could not initialize a manager client"
+                )
             return None
         try:
             if client.supports(feature_name):
                 return client
-        except RuntimeError:
+        except RuntimeError as exc:
+            if os.getenv("DOCKER_MANAGER_URL", "").strip():
+                raise RuntimeError(f"Docker-Manager feature detection failed for {feature_name}: {exc}") from exc
             return None
+        if os.getenv("DOCKER_MANAGER_URL", "").strip():
+            raise RuntimeError(
+                f"Docker-Manager is configured via DOCKER_MANAGER_URL, but /version did not advertise required feature {feature_name}"
+            )
         return None
 
     @staticmethod
@@ -859,12 +869,32 @@ class DockerStack:
         rendered_content: str,
         options: Dict[str, object],
     ) -> Optional[str]:
-        payload = manager_client.deploy_stack(
-            stack=stack_name,
-            namespace=namespace,
-            compose=rendered_content,
-            options=options,
-        )
+        if not hasattr(manager_client, "deploy_stack_stream"):
+            payload = manager_client.deploy_stack(
+                stack=stack_name,
+                namespace=namespace,
+                compose=rendered_content,
+                options=options,
+            )
+        else:
+            try:
+                payload = manager_client.deploy_stack_stream(
+                    stack=stack_name,
+                    namespace=namespace,
+                    compose=rendered_content,
+                    options=options,
+                    on_event=DockerStack._print_manager_deploy_event,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                if "POST /api/stacks/deploy/stream" not in message or "HTTP 404" not in message:
+                    raise
+                payload = manager_client.deploy_stack(
+                    stack=stack_name,
+                    namespace=namespace,
+                    compose=rendered_content,
+                    options=options,
+                )
         warnings = payload.get("warnings") or []
         for warning in warnings:
             print(f"[manager] {warning}")
@@ -875,6 +905,38 @@ class DockerStack:
         if isinstance(stderr, str) and stderr.strip():
             print(stderr.rstrip())
         return None
+
+    @staticmethod
+    def _print_manager_deploy_event(event: Dict[str, object]) -> None:
+        event_name = event.get("event")
+        data = event.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        if event_name == "stdout":
+            line = str(data.get("line") or "").rstrip()
+            if line:
+                print(line, flush=True)
+        elif event_name == "stderr":
+            line = str(data.get("line") or "").rstrip()
+            if line:
+                print(line, file=sys.stderr, flush=True)
+        elif event_name == "command":
+            program = data.get("program") or "manager"
+            stack = data.get("stack")
+            suffix = f" {stack}" if stack else ""
+            print(f"[manager] {program}{suffix}", flush=True)
+        elif event_name == "resource":
+            kind = data.get("kind")
+            logical_name = data.get("logical_name")
+            actual_name = data.get("actual_name")
+            if kind and logical_name and actual_name:
+                print(f"[manager] {kind} {logical_name} -> {actual_name}", flush=True)
+        elif event_name == "service_progress":
+            service = data.get("service") or "service"
+            status = data.get("status") or "progress"
+            message = data.get("message") or data.get("error") or ""
+            if message:
+                print(f"[manager] {service}: {status}: {message}", flush=True)
 
     @staticmethod
     def _rollback_via_manager(
@@ -1145,10 +1207,21 @@ def _manager_deploy_suggestion(message: str) -> Optional[str]:
             "Suggestion: configure a trusted workflow/deployment rule on Docker-Manager for this repository, workflow file, "
             "stack, namespace, and service scope, then rerun the deploy."
         )
+    if "external network" in lowered and "outside the stack scope" in lowered:
+        return (
+            "Suggestion: the compose file references an external Docker network that Docker-Manager does not consider owned "
+            "by this stack. Either allow that external network in the Docker-Manager deployment rule, attach the service to "
+            "a stack-owned network, or relabel/recreate the existing network with the expected stack ownership before deploying."
+        )
     if "manager request failed" in lowered and "/version" in lowered:
         return (
             "Suggestion: check that the manager URL is reachable from the runner and that the setup action exported "
             "DOCKER_MANAGER_URL and the matching Docker auth headers."
+        )
+    if "docker-manager is configured" in lowered and "did not advertise required feature" in lowered:
+        return (
+            "Suggestion: deploy the current Docker-Manager server code and verify GET /version returns MesudipFeatures "
+            "including mesudip-docker-enterprise-v1 or docker_stack_deploy_v1 for this manager endpoint."
         )
     return None
 

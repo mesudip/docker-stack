@@ -30,7 +30,7 @@ def test_deploy_stack_uses_direct_stack_api(monkeypatch):
     client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
     calls = []
 
-    def fake_request(path, *, method="GET", payload=None):
+    def fake_request(path, *, method="GET", payload=None, timeout_secs=None):
         calls.append((method, path, payload))
         return {"warnings": []}
 
@@ -57,6 +57,62 @@ def test_deploy_stack_uses_direct_stack_api(monkeypatch):
     ]
 
 
+def test_deploy_stack_stream_uses_sse_api(monkeypatch):
+    client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
+    calls = []
+    seen_events = []
+
+    def fake_events(path, *, method="GET", payload=None, timeout_secs=None):
+        calls.append((method, path, payload, timeout_secs))
+        yield {"event": "stdout", "data": {"line": "creating service api"}}
+        yield {"event": "done", "data": {"warnings": [], "stdout": "ok", "stderr": ""}}
+
+    monkeypatch.setattr(client, "_request_sse_events", fake_events)
+
+    payload = client.deploy_stack_stream(
+        stack="trusted-publish-test",
+        namespace="default",
+        compose="services: {}",
+        options={},
+        on_event=seen_events.append,
+    )
+
+    assert payload == {"warnings": [], "stdout": "ok", "stderr": ""}
+    assert seen_events == [
+        {"event": "stdout", "data": {"line": "creating service api"}},
+        {"event": "done", "data": {"warnings": [], "stdout": "ok", "stderr": ""}},
+    ]
+    assert calls == [
+        (
+            "POST",
+            "/api/stacks/deploy/stream",
+            {
+                "stack": "trusted-publish-test",
+                "namespace": "default",
+                "compose": "services: {}",
+            },
+            300,
+        )
+    ]
+
+
+def test_deploy_stack_stream_raises_manager_error(monkeypatch):
+    client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
+
+    def fake_events(path, *, method="GET", payload=None, timeout_secs=None):
+        yield {"event": "error", "data": {"message": "deploy failed"}}
+
+    monkeypatch.setattr(client, "_request_sse_events", fake_events)
+
+    with pytest.raises(RuntimeError, match="deploy failed"):
+        client.deploy_stack_stream(
+            stack="team-a",
+            namespace="default",
+            compose="services: {}",
+            options={},
+        )
+
+
 def test_deploy_stack_sends_only_matching_registry_auth(monkeypatch, tmp_path):
     docker_config = tmp_path / "config.json"
     docker_config.write_text(
@@ -74,7 +130,7 @@ def test_deploy_stack_sends_only_matching_registry_auth(monkeypatch, tmp_path):
     client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
     calls = []
 
-    def fake_request(path, *, method="GET", payload=None):
+    def fake_request(path, *, method="GET", payload=None, timeout_secs=None):
         calls.append((method, path, payload))
         return {"warnings": []}
 
@@ -127,7 +183,7 @@ def test_deploy_stack_uses_creds_store_when_auth_entry_is_empty(monkeypatch, tmp
     client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
     calls = []
 
-    def fake_request(path, *, method="GET", payload=None):
+    def fake_request(path, *, method="GET", payload=None, timeout_secs=None):
         calls.append((method, path, payload))
         return {"warnings": []}
 

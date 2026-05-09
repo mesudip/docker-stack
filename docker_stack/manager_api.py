@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import socket
 import ssl
 import subprocess
 import urllib.error
@@ -181,6 +182,23 @@ def _public_deploy_options(options: Optional[Dict[str, Any]], compose: str) -> O
     return prepared
 
 
+def _env_timeout_secs(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _manager_deploy_timeout_secs(default: int) -> int:
+    return _env_timeout_secs(
+        "DOCKER_MANAGER_DEPLOY_TIMEOUT_SECS",
+        _env_timeout_secs("DOCKER_MANAGER_API_TIMEOUT_SECS", max(default, 300)),
+    )
+
+
 def _manager_target_from_env() -> Optional[str]:
     manager_url = os.getenv("DOCKER_MANAGER_URL", "").strip()
     if manager_url:
@@ -238,6 +256,7 @@ class ManagerApiClient:
         *,
         method: str = "GET",
         payload: Optional[Dict[str, Any]] = None,
+        timeout_secs: Optional[int] = None,
     ) -> Any:
         url = f"{self.manager_url}{path}"
         headers = {**self.default_headers}
@@ -249,8 +268,9 @@ class ManagerApiClient:
         context = None
         if url.startswith("https://") and self.skip_tls_verify:
             context = ssl._create_unverified_context()
+        timeout = max(1, int(timeout_secs or self.timeout_secs))
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_secs, context=context) as response:
+            with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = ""
@@ -263,8 +283,76 @@ class ManagerApiClient:
             raise RuntimeError(f"Manager request failed ({method} {path}): HTTP {exc.code}{body}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Manager request failed ({method} {path}): {exc.reason}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise RuntimeError(f"Manager request failed ({method} {path}): timed out after {timeout}s") from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Manager response is not valid JSON ({method} {path})") from exc
+
+    def _request_sse_events(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        payload: Optional[Dict[str, Any]] = None,
+        timeout_secs: Optional[int] = None,
+    ):
+        url = f"{self.manager_url}{path}"
+        headers = {**self.default_headers, "Accept": "text/event-stream"}
+        data = None
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, method=method, headers=headers, data=data)
+        context = None
+        if url.startswith("https://") and self.skip_tls_verify:
+            context = ssl._create_unverified_context()
+        timeout = max(1, int(timeout_secs or self.timeout_secs))
+
+        event_name = "message"
+        data_lines = []
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        if data_lines:
+                            raw_data = "\n".join(data_lines)
+                            try:
+                                event_data = json.loads(raw_data)
+                            except json.JSONDecodeError:
+                                event_data = {"raw": raw_data}
+                            yield {"event": event_name, "data": event_data}
+                        event_name = "message"
+                        data_lines = []
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    field, _, value = line.partition(":")
+                    value = value[1:] if value.startswith(" ") else value
+                    if field == "event":
+                        event_name = value or "message"
+                    elif field == "data":
+                        data_lines.append(value)
+                if data_lines:
+                    raw_data = "\n".join(data_lines)
+                    try:
+                        event_data = json.loads(raw_data)
+                    except json.JSONDecodeError:
+                        event_data = {"raw": raw_data}
+                    yield {"event": event_name, "data": event_data}
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                payload = exc.read().decode("utf-8", errors="replace").strip()
+                if payload:
+                    body = f": {payload}"
+            except Exception:
+                body = ""
+            raise RuntimeError(f"Manager request failed ({method} {path}): HTTP {exc.code}{body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Manager request failed ({method} {path}): {exc.reason}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise RuntimeError(f"Manager request failed ({method} {path}): timed out after {timeout}s") from exc
 
     def detect_features(self) -> Set[str]:
         if self._features is not None:
@@ -481,7 +569,40 @@ class ManagerApiClient:
             "/api/stacks/deploy",
             method="POST",
             payload=payload,
+            timeout_secs=_manager_deploy_timeout_secs(self.timeout_secs),
         )
+
+    def deploy_stack_stream(
+        self,
+        *,
+        stack: str,
+        namespace: str,
+        compose: str,
+        options: Optional[Dict[str, Any]] = None,
+        on_event=None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"stack": stack, "namespace": namespace, "compose": compose}
+        prepared_options = _public_deploy_options(options, compose)
+        if prepared_options:
+            payload["options"] = prepared_options
+
+        done: Optional[Dict[str, Any]] = None
+        for event in self._request_sse_events(
+            "/api/stacks/deploy/stream",
+            method="POST",
+            payload=payload,
+            timeout_secs=_manager_deploy_timeout_secs(self.timeout_secs),
+        ):
+            if on_event:
+                on_event(event)
+            event_name = event.get("event")
+            data = event.get("data")
+            if event_name == "error":
+                message = data.get("message") if isinstance(data, dict) else str(data)
+                raise RuntimeError(message or "manager deploy stream failed")
+            if event_name == "done" and isinstance(data, dict):
+                done = data
+        return done or {"warnings": [], "stdout": "", "stderr": ""}
 
     def rollback_stack(self, *, stack: str, namespace: str, version: str) -> Dict[str, Any]:
         quoted_stack = urllib.parse.quote(stack, safe="")
