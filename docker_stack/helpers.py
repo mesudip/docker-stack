@@ -89,12 +89,8 @@ def run_cli_command(
         if interactive:
             return None
         return (result.stdout or "").strip()
-    except Exception as e:
-        # Log the error and re-raise the exception
-        print(f"Error running command: {e}")
-        print(f"stdout: {getattr(e, 'stdout', None)}")
-        print(f"stderr: {getattr(e, 'stderr', None)}")
-        raise e
+    except Exception:
+        raise
 
 
 class Command:

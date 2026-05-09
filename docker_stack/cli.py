@@ -1112,6 +1112,67 @@ def active_shell_config_dir(context_name: str) -> Optional[Path]:
     return Path(docker_config)
 
 
+GITHUB_WORKFLOW_RESTRICTED_MESSAGE = "github workflow tokens are restricted to stack APIs and service image updates"
+
+
+def _format_command(command) -> str:
+    if isinstance(command, (list, tuple)):
+        return " ".join(str(part) for part in command)
+    return str(command)
+
+
+def _error_output(exc: subprocess.CalledProcessError) -> str:
+    values = []
+    stdout = getattr(exc, "stdout", None) or getattr(exc, "output", None)
+    stderr = getattr(exc, "stderr", None)
+    if stdout:
+        values.append(str(stdout).strip())
+    if stderr:
+        values.append(str(stderr).strip())
+    return "\n".join(value for value in values if value)
+
+
+def _manager_deploy_suggestion(message: str) -> Optional[str]:
+    if GITHUB_WORKFLOW_RESTRICTED_MESSAGE in message:
+        return (
+            "Suggestion: this workflow is using a Docker-Manager GitHub token, but docker-stack fell back to a raw Docker CLI API. "
+            "Run the mesudip/docker-stack@v2 setup action before deploy, keep DOCKER_MANAGER_URL/DOCKER_CONTEXT from that step, "
+            "and make sure the manager /version endpoint advertises docker-stack deploy support."
+        )
+    lowered = message.lower()
+    if "github workflow" in lowered and ("trusted" in lowered or "not allowed" in lowered or "forbidden" in lowered):
+        return (
+            "Suggestion: configure a trusted workflow/deployment rule on Docker-Manager for this repository, workflow file, "
+            "stack, namespace, and service scope, then rerun the deploy."
+        )
+    if "manager request failed" in lowered and "/version" in lowered:
+        return (
+            "Suggestion: check that the manager URL is reachable from the runner and that the setup action exported "
+            "DOCKER_MANAGER_URL and the matching Docker auth headers."
+        )
+    return None
+
+
+def _format_called_process_error(exc: subprocess.CalledProcessError) -> str:
+    output = _error_output(exc)
+    lines = [f"docker-stack: command failed with exit code {exc.returncode}: {_format_command(exc.cmd)}"]
+    if output:
+        lines.append(output)
+    suggestion = _manager_deploy_suggestion(output)
+    if suggestion:
+        lines.extend(["", suggestion])
+    return "\n".join(lines)
+
+
+def _format_runtime_error(exc: RuntimeError) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    lines = [f"docker-stack: {message}"]
+    suggestion = _manager_deploy_suggestion(message)
+    if suggestion:
+        lines.extend(["", suggestion])
+    return "\n".join(lines)
+
+
 def main(args: List[str] = None):
     parser = argparse.ArgumentParser(description="Deploy and manage Docker stacks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1314,59 +1375,66 @@ def main(args: List[str] = None):
                 print("Docker-Manager auth header cleared from ~/.docker/config.json.")
             return
 
-    docker = Docker(registries=args.user)
-    docker.load_env()
+    try:
+        docker = Docker(registries=args.user)
+        docker.load_env()
 
-    if args.command == "build":
-        docker.stack.build_and_push(args.compose_file, push=args.push)
-    elif args.command == "push":
-        docker.stack.push(args.compose_file)
-    elif args.command == "deploy":
-        docker.stack.deploy(
-            args.stack_name,
-            args.compose_file,
-            args.with_registry_auth,
-            tag=args.tag,
-            show_generated=args.show_generated,
-            namespace=args.namespace,
-            dry_run=args.ro,
-        )
-    elif args.command == "ls":
-        docker.stack.ls()
-    elif args.command == "node":
-        if args.node_command == "ls":
-            docker.node.ls()
+        if args.command == "build":
+            docker.stack.build_and_push(args.compose_file, push=args.push)
+        elif args.command == "push":
+            docker.stack.push(args.compose_file)
+        elif args.command == "deploy":
+            docker.stack.deploy(
+                args.stack_name,
+                args.compose_file,
+                args.with_registry_auth,
+                tag=args.tag,
+                show_generated=args.show_generated,
+                namespace=args.namespace,
+                dry_run=args.ro,
+            )
+        elif args.command == "ls":
+            docker.stack.ls()
+        elif args.command == "node":
+            if args.node_command == "ls":
+                docker.node.ls()
 
-    elif args.command == "rm":
-        docker.stack.rm(args.stack_name)
-    elif args.command == "prune":
-        docker.stack.prune()
-    elif args.command == "cat":
-        version_to_cat = args.version
-        if version_to_cat is None:
-            versions_list = docker.stack.versions(args.stack_name, namespace=args.namespace, print_output=False)
-            if versions_list:
-                # Assuming versions are integers, find the maximum
-                latest_version = max(int(v[0]) for v in versions_list if v[0].isdigit())
-                version_to_cat = str(latest_version)
-            else:
-                print(f"No versions found for stack '{args.stack_name}'.")
-                sys.exit(1)
-        print(docker.stack.cat(args.stack_name, version_to_cat, namespace=args.namespace))
-    elif args.command == "checkout":
-        docker.stack.checkout(
-            args.stack_name,
-            args.version,
-            namespace=args.namespace,
-            dry_run=args.ro,
-        )
-    elif args.command == "versions" or args.command == "version":
-        docker.stack.versions(args.stack_name, namespace=args.namespace)
-    if args.ro:
-        print("Following commands were not executed:")
-        [print(" >> " + str(x)) for x in docker.stack.commands if x]
-    else:
-        [x.execute() for x in docker.stack.commands]
+        elif args.command == "rm":
+            docker.stack.rm(args.stack_name)
+        elif args.command == "prune":
+            docker.stack.prune()
+        elif args.command == "cat":
+            version_to_cat = args.version
+            if version_to_cat is None:
+                versions_list = docker.stack.versions(args.stack_name, namespace=args.namespace, print_output=False)
+                if versions_list:
+                    # Assuming versions are integers, find the maximum
+                    latest_version = max(int(v[0]) for v in versions_list if v[0].isdigit())
+                    version_to_cat = str(latest_version)
+                else:
+                    print(f"No versions found for stack '{args.stack_name}'.")
+                    sys.exit(1)
+            print(docker.stack.cat(args.stack_name, version_to_cat, namespace=args.namespace))
+        elif args.command == "checkout":
+            docker.stack.checkout(
+                args.stack_name,
+                args.version,
+                namespace=args.namespace,
+                dry_run=args.ro,
+            )
+        elif args.command == "versions" or args.command == "version":
+            docker.stack.versions(args.stack_name, namespace=args.namespace)
+        if args.ro:
+            print("Following commands were not executed:")
+            [print(" >> " + str(x)) for x in docker.stack.commands if x]
+        else:
+            [x.execute() for x in docker.stack.commands]
+    except subprocess.CalledProcessError as exc:
+        print(_format_called_process_error(exc), file=sys.stderr)
+        sys.exit(exc.returncode or 2)
+    except RuntimeError as exc:
+        print(_format_runtime_error(exc), file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

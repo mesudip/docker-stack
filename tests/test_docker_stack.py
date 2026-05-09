@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -576,6 +577,53 @@ def test_manager_deploy_preserves_with_registry_auth_option(monkeypatch, tmp_pat
     docker.stack.commands[-1].execute()
     assert fake_manager.deploy_payloads[-1]["stack"] == "team-a"
     assert fake_manager.deploy_payloads[-1]["options"] == {"with_registry_auth": True}
+
+
+def test_deploy_restricted_raw_docker_error_is_actionable(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  api:\n    image: busybox\n")
+
+    def restricted_command(command, **_kwargs):
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output="",
+            stderr="Error response from daemon: github workflow tokens are restricted to stack APIs and service image updates",
+        )
+
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", restricted_command)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["deploy", "team-a", str(compose_file)])
+
+    assert excinfo.value.code == 1
+    stderr = capsys.readouterr().err
+    assert "docker-stack: command failed with exit code 1: docker config ls" in stderr
+    assert "Suggestion: this workflow is using a Docker-Manager GitHub token" in stderr
+    assert "Traceback" not in stderr
+
+
+def test_manager_deploy_runtime_error_is_actionable(monkeypatch, tmp_path, capsys):
+    class UntrustedWorkflowManager(FakeManagerClient):
+        def deploy_stack(self, *, stack, namespace, compose, options=None):
+            raise RuntimeError(
+                "Manager request failed (POST /api/stacks/deploy): HTTP 403: "
+                '{"message":"github workflow is not trusted for this stack scope"}'
+            )
+
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: UntrustedWorkflowManager())
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  api:\n    image: busybox\n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["deploy", "team-a", str(compose_file)])
+
+    assert excinfo.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "docker-stack: Manager request failed (POST /api/stacks/deploy): HTTP 403" in stderr
+    assert "Suggestion: configure a trusted workflow/deployment rule" in stderr
+    assert "Traceback" not in stderr
 
 
 def test_manager_checkout_with_registry_auth_uses_deploy_api(monkeypatch):
