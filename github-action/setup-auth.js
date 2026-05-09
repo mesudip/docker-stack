@@ -98,7 +98,6 @@ async function main() {
 
   const requestedContext = input("context").trim();
   const contextName = requestedContext || "dm-proxy";
-  const actionPath = process.env.GITHUB_ACTION_PATH || path.resolve(__dirname, "..");
   const providedDockerConfigDir = input("docker-config-dir").trim();
   const dockerConfigDir =
     providedDockerConfigDir ||
@@ -114,8 +113,6 @@ async function main() {
   if (!["oidc", "access-token"].includes(authMode)) {
     throw new Error(`Unsupported auth-mode: ${authMode}`);
   }
-
-  run("python3", ["-m", "pip", "install", "--upgrade", actionPath], { stdio: "inherit" });
 
   const cliArgs = [manager, "--docker-config-dir", dockerConfigDir];
   if (requestedContext) {

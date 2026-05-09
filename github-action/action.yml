@@ -1,0 +1,47 @@
+name: Setup docker-stack auth runtime
+description: Configure Docker auth/context for docker-stack after Python has been installed.
+
+inputs:
+  manager:
+    description: Docker-Manager host, IP, or URL.
+    required: true
+  context:
+    description: Optional Docker context name. Defaults to dm-proxy.
+    required: false
+    default: ""
+  auth-mode:
+    description: Optional auth mode. One of auto, oidc, access-token.
+    required: false
+    default: auto
+  access-token:
+    description: Optional pre-issued manager access token.
+    required: false
+    default: ""
+  oidc-audience:
+    description: Audience to request for GitHub OIDC tokens.
+    required: false
+    default: docker-manager
+  docker-config-dir:
+    description: Optional isolated Docker config directory.
+    required: false
+    default: ""
+  verify-ssl:
+    description: Verify the manager TLS certificate. Defaults to false.
+    required: false
+    default: "false"
+
+outputs:
+  docker-config:
+    description: Docker config directory configured by the action.
+  docker-context:
+    description: Docker context selected by the action.
+  manager-url:
+    description: Normalized Docker-Manager URL.
+  skip-tls-verify:
+    description: Whether TLS verification is skipped for the manager endpoint.
+
+runs:
+  using: node20
+  main: setup-auth.js
+  post: cleanup.js
+  post-if: always()

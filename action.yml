@@ -33,15 +33,37 @@ inputs:
 outputs:
   docker-config:
     description: Docker config directory configured by the action.
+    value: ${{ steps.setup.outputs.docker-config }}
   docker-context:
     description: Docker context selected by the action.
+    value: ${{ steps.setup.outputs.docker-context }}
   manager-url:
     description: Normalized Docker-Manager URL.
+    value: ${{ steps.setup.outputs.manager-url }}
   skip-tls-verify:
     description: Whether TLS verification is skipped for the manager endpoint.
+    value: ${{ steps.setup.outputs.skip-tls-verify }}
 
 runs:
-  using: node20
-  main: github-action/setup-auth.js
-  post: github-action/cleanup.js
-  post-if: always()
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+
+    - name: Install docker-stack
+      shell: bash
+      run: python3 -m pip install --upgrade "$GITHUB_ACTION_PATH"
+
+    - name: Setup auth
+      id: setup
+      uses: mesudip/docker-stack/github-action@v2
+      with:
+        manager: ${{ inputs.manager }}
+        context: ${{ inputs.context }}
+        auth-mode: ${{ inputs.auth-mode }}
+        access-token: ${{ inputs.access-token }}
+        oidc-audience: ${{ inputs.oidc-audience }}
+        docker-config-dir: ${{ inputs.docker-config-dir }}
+        verify-ssl: ${{ inputs.verify-ssl }}

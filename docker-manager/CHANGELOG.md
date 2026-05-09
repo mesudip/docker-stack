@@ -4,8 +4,8 @@
 
 ### Added
 
-- GitHub Actions support is now implemented as a Node.js action with setup and post-cleanup phases.
-- The action now exports `DOCKER_CONFIG`, `DOCKER_CONTEXT`, and `DOCKER_MANAGER_URL` for later workflow steps and removes its generated Docker config directory after the job.
+- GitHub Actions support now uses `actions/setup-python@v6` before installing `docker-stack`, avoiding PEP 668 failures from externally managed system Python installs while keeping Node.js post-action cleanup.
+- The action now exports `DOCKER_CONFIG`, `DOCKER_CONTEXT`, and `DOCKER_MANAGER_URL` for later workflow steps.
 - Manager deploys now receive matching registry auth when `docker-stack deploy --with-registry-auth` is used, including credentials from Docker credential helpers.
 - Manager-backed versioned stack config now stores source metadata in `x-files` for compose/config recovery and audit workflows.
 

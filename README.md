@@ -65,13 +65,13 @@ permissions:
 
 steps:
   - uses: actions/checkout@v4
-  - uses: mesudip/docker-stack@main
+  - uses: mesudip/docker-stack@v2
     with:
       manager: https://manager.example.com:2378
   - run: docker-stack deploy --with-registry-auth my-stack docker-compose.yml
 ```
 
-The action installs `docker-stack`, defaults to GitHub OIDC auth and the `dm-proxy` context, exports `DOCKER_CONFIG`, `DOCKER_CONTEXT`, and `DOCKER_MANAGER_URL` for later steps, and removes its generated Docker config directory in the post-action cleanup phase.
+The action uses `actions/setup-python@v6`, installs `docker-stack`, defaults to GitHub OIDC auth and the `dm-proxy` context, exports `DOCKER_CONFIG`, `DOCKER_CONTEXT`, and `DOCKER_MANAGER_URL` for later steps, and removes its generated Docker config directory in the post-action cleanup phase.
 
 ## Core Capabilities
 

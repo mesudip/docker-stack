@@ -7,7 +7,7 @@
 - Secret definitions can now use Docker Compose-style `environment` entries so secret content is read from environment variables at deploy time.
 - `x-generated` is now accepted as an alias for `x-generate` on generated secrets.
 - Versioned stack state now stores source metadata in `x-files`, including the original compose file, referenced non-secret environment values, and config source files used by `file` / `x-template-file`.
-- GitHub Actions deployments now have a dedicated Node.js action implementation with automatic Docker config cleanup after the workflow.
+- GitHub Actions deployments now use `actions/setup-python@v6` before installing `docker-stack`, avoiding PEP 668 failures from externally managed system Python installs while keeping Node.js post-action cleanup.
 
 ### Changed
 
