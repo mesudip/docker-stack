@@ -32,7 +32,6 @@ from docker_stack.manager_api import (
 from docker_stack.registry import DockerRegistry
 from .envsubst import LineCheckResult, SubstitutionError, envsubst, envsubst_load_file
 
-
 DOCKER_SHELL_ENDPOINT_ENV_VARS = (
     "DOCKER_HOST",
     "DOCKER_TLS_VERIFY",
@@ -148,7 +147,9 @@ def _map_substitution_error(entry: EnvFileEntry, err: SubstitutionError) -> List
     return mapped_results
 
 
-def _resolve_env_entries(entries: List[EnvFileEntry], env_file: str, base_env: Optional[Dict[str, str]] = None, max_cycles: int = 5) -> Dict[str, str]:
+def _resolve_env_entries(
+    entries: List[EnvFileEntry], env_file: str, base_env: Optional[Dict[str, str]] = None, max_cycles: int = 5
+) -> Dict[str, str]:
     base_env = dict(base_env or os.environ)
     current_values = {entry.key: entry.value for entry in entries}
     local_keys = set(current_values.keys())
@@ -198,9 +199,7 @@ def _resolve_env_entries(entries: List[EnvFileEntry], env_file: str, base_env: O
                 break
 
     if cyclic_results:
-        deduped = {
-            (result.line_no, result.variable_name, result.start_index): result for result in cyclic_results
-        }
+        deduped = {(result.line_no, result.variable_name, result.start_index): result for result in cyclic_results}
         ordered_results = sorted(deduped.values(), key=lambda x: (x.line_no, x.start_index or 0))
         raise EnvFileResolutionError(
             env_file,
@@ -458,7 +457,7 @@ class DockerStack:
                 processed_objects[name] = {"name": response["actual_name"], "external": True}
                 return
 
-            (object_name, command) = manager.create(docker_object_name, data, labels=labels, stack=stack)
+            object_name, command = manager.create(docker_object_name, data, labels=labels, stack=stack)
             if not command.isNop():
                 self.commands.append(command)
                 if is_generated_secret:
@@ -484,9 +483,7 @@ class DockerStack:
                 if env_value in (None, ""):
                     raise ValueError(f"Secret {name} references environment variable {env_name}, but it is not set.")
                 add_obj(name, env_value, explicit_name=explicit_name)
-            elif isinstance(details, dict) and manager.object_type == "secret" and (
-                "x-generate" in details or "x-generated" in details
-            ):
+            elif isinstance(details, dict) and manager.object_type == "secret" and ("x-generate" in details or "x-generated" in details):
                 # Support both spellings for compatibility.
                 generate_options = details.get("x-generate", details.get("x-generated"))
                 if isinstance(generate_options, bool) and generate_options:
@@ -496,7 +493,9 @@ class DockerStack:
                         add_obj(name, generate_secret(), explicit_name=explicit_name, is_generated_secret=True)
                 elif isinstance(generate_options, int):
                     if manager_client and stack:
-                        add_obj(name, "", explicit_name=explicit_name, is_generated_secret=True, generate_options={"length": generate_options})
+                        add_obj(
+                            name, "", explicit_name=explicit_name, is_generated_secret=True, generate_options={"length": generate_options}
+                        )
                     else:
                         add_obj(name, generate_secret(length=generate_options), explicit_name=explicit_name, is_generated_secret=True)
                 elif isinstance(generate_options, dict):
@@ -578,9 +577,7 @@ class DockerStack:
                     str(item.get("stack")): [
                         str(version)
                         for version in (
-                            item.get("versions")
-                            if isinstance(item.get("versions"), list)
-                            else item.get("available_versions", [])
+                            item.get("versions") if isinstance(item.get("versions"), list) else item.get("available_versions", [])
                         )
                         if str(version).strip()
                     ]
@@ -850,10 +847,7 @@ class DockerStack:
         service_count = summary.get("service_count", 0)
         config_count = summary.get("config_count", 0)
         secret_count = summary.get("secret_count", 0)
-        print(
-            "[manager] validation: "
-            f"services={service_count}, configs={config_count}, secrets={secret_count}"
-        )
+        print("[manager] validation: " f"services={service_count}, configs={config_count}, secrets={secret_count}")
         return None
 
     @staticmethod
@@ -1032,10 +1026,7 @@ class DockerNode:
             ("Address", "address"),
         ]
 
-        widths = {
-            key: max(len(title), max((len(str(row[key])) for row in rows), default=0))
-            for title, key in columns
-        }
+        widths = {key: max(len(title), max((len(str(row[key])) for row in rows), default=0)) for title, key in columns}
         terminal_width = shutil.get_terminal_size((120, 20)).columns
         static_width = sum(widths.values()) + (3 * (len(columns) - 1))
         label_width = max(24, min(60, terminal_width - static_width - 3 - len("Labels")))
@@ -1083,9 +1074,7 @@ class DockerNode:
             if not line:
                 continue
             node = json.loads(line)
-            inspect = json.loads(
-                run_cli_command(["docker", "node", "inspect", node["ID"], "--format", "{{json .}}"], log=False)
-            )
+            inspect = json.loads(run_cli_command(["docker", "node", "inspect", node["ID"], "--format", "{{json .}}"], log=False))
             labels = inspect.get("Spec", {}).get("Labels", {})
             manager_status = node.get("ManagerStatus", "").strip()
             role = inspect.get("Spec", {}).get("Role", "-")

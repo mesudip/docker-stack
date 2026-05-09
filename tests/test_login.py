@@ -40,13 +40,7 @@ def test_merge_docker_config_header_with_empty_config(tmp_path):
 def test_merge_docker_config_header_preserves_auths(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
-        json.dumps(
-            {
-                "auths": {
-                    "registry.example.com": {"auth": "abc"}
-                }
-            }
-        ),
+        json.dumps({"auths": {"registry.example.com": {"auth": "abc"}}}),
         encoding="utf-8",
     )
 
@@ -60,13 +54,7 @@ def test_merge_docker_config_header_preserves_auths(tmp_path):
 def test_merge_docker_config_header_preserves_existing_http_headers(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
-        json.dumps(
-            {
-                "HttpHeaders": {
-                    "X-Test": "value"
-                }
-            }
-        ),
+        json.dumps({"HttpHeaders": {"X-Test": "value"}}),
         encoding="utf-8",
     )
 
@@ -319,8 +307,7 @@ def test_build_auth_url_uses_manager_broker_endpoint(monkeypatch):
     )
 
     assert auth_url == (
-        "https://broker.example.test"
-        "/api/auth/cli/login?redirect_uri=http%3A%2F%2Flocalhost%3A8079%2Fauth%2Fcallback&state=state-1"
+        "https://broker.example.test" "/api/auth/cli/login?redirect_uri=http%3A%2F%2Flocalhost%3A8079%2Fauth%2Fcallback&state=state-1"
     )
 
 
@@ -403,7 +390,9 @@ def test_resolve_login_config_keeps_defaults_without_discovery(monkeypatch):
 def test_resolve_shell_login_config_uses_persisted_context(monkeypatch):
     monkeypatch.setattr(
         "docker_stack.login.docker_context_target",
-        lambda context_name, docker_config_dir=None: "tcp://172.31.0.6:2378" if docker_config_dir == isolated_docker_config_dir("office") else None,
+        lambda context_name, docker_config_dir=None: (
+            "tcp://172.31.0.6:2378" if docker_config_dir == isolated_docker_config_dir("office") else None
+        ),
     )
     monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value: ("https://172.31.0.6:2378", True))
 
@@ -429,7 +418,9 @@ def test_ensure_isolated_login_skips_browser_when_token_is_active(monkeypatch, t
     monkeypatch.setattr("docker_stack.login.ensure_isolated_docker_config", lambda _: tmp_path / "config.json")
     monkeypatch.setattr("docker_stack.login.configure_docker_context_in_store", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("docker_stack.login.token_is_active", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr("docker_stack.login.browser_login", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not login")))
+    monkeypatch.setattr(
+        "docker_stack.login.browser_login", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not login"))
+    )
 
     config_dir, result = ensure_isolated_login(config, docker_config_dir=tmp_path)
 
@@ -489,11 +480,7 @@ def test_setup_auth_skips_profile_validation_for_github_oidc(monkeypatch, tmp_pa
     monkeypatch.setattr("docker_stack.login.configure_docker_context_in_store", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("docker_stack.login.token_is_active", fake_token_is_active)
 
-    github_token = (
-        "header."
-        "eyJpc3MiOiJodHRwczovL3Rva2VuLmFjdGlvbnMuZ2l0aHVidXNlcmNvbnRlbnQuY29tIiwiZXhwIjoxOTAwMDAwMDAwfQ."
-        "signature"
-    )
+    github_token = "header." "eyJpc3MiOiJodHRwczovL3Rva2VuLmFjdGlvbnMuZ2l0aHVidXNlcmNvbnRlbnQuY29tIiwiZXhwIjoxOTAwMDAwMDAwfQ." "signature"
     result = setup_auth(
         config,
         github_oidc_token=github_token,
@@ -517,9 +504,7 @@ def test_browser_login_handles_callback_and_token_exchange(monkeypatch):
     def fake_exchange(login_config, code, redirect_uri, **kwargs):
         assert code == "auth-code"
         assert redirect_uri.endswith("/auth/callback")
-        return {
-            "access_token": "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"
-        }
+        return {"access_token": "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"}
 
     def fake_browser_open(auth_url):
         parsed = urllib.parse.urlparse(auth_url)
@@ -568,17 +553,14 @@ def test_browser_login_accepts_pasted_callback_when_browser_unavailable(monkeypa
 
     def fake_build_auth_url(login_config, redirect_uri, state):
         captured["callback_url"] = f"{redirect_uri}?code=manual-code&state={state}"
-        return (
-            "https://keycloak.example.com/realms/master/protocol/openid-connect/auth?"
-            + urllib.parse.urlencode({"redirect_uri": redirect_uri, "state": state})
+        return "https://keycloak.example.com/realms/master/protocol/openid-connect/auth?" + urllib.parse.urlencode(
+            {"redirect_uri": redirect_uri, "state": state}
         )
 
     def fake_exchange(login_config, code, redirect_uri, **kwargs):
         assert code == "manual-code"
         assert redirect_uri.endswith("/auth/callback")
-        return {
-            "access_token": "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"
-        }
+        return {"access_token": "header.eyJleHAiOjE5MDAwMDAwMDB9.signature"}
 
     def port_finder():
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

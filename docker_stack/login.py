@@ -162,6 +162,7 @@ def _request_json(url: str, *, timeout: int = 5, verify_tls: bool = True) -> Dic
     with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
         return json.loads(response.read().decode("utf-8"))
 
+
 def _request_manager_json(
     config: DockerManagerLoginConfig,
     path: str,
@@ -286,7 +287,11 @@ def resolve_login_config(
 
     return DockerManagerLoginConfig(
         manager_url=resolved_manager_url,
-        context_name=context_name or os.getenv("DOCKER_MANAGER_CONTEXT_NAME") or inferred_context_name or current_context_name or "dm-proxy",
+        context_name=context_name
+        or os.getenv("DOCKER_MANAGER_CONTEXT_NAME")
+        or inferred_context_name
+        or current_context_name
+        or "dm-proxy",
         timeout_secs=int(timeout_secs or os.getenv("DOCKER_MANAGER_LOGIN_TIMEOUT_SECS", "300")),
         skip_tls_verify=skip_tls_verify,
     )
@@ -700,10 +705,7 @@ def _session_needs_manual_callback() -> bool:
 
 
 def _read_manual_callback_url() -> Optional[str]:
-    print(
-        "After login, paste the full callback URL here if the browser cannot reach localhost "
-        "on this machine."
-    )
+    print("After login, paste the full callback URL here if the browser cannot reach localhost " "on this machine.")
     try:
         callback_url = input("Callback URL: ").strip()
     except EOFError:

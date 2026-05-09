@@ -33,11 +33,7 @@ def _docker_config_headers() -> Dict[str, str]:
 
 def _docker_config_path() -> Path:
     config_root = os.getenv("DOCKER_CONFIG")
-    return (
-        Path(config_root) / "config.json"
-        if config_root
-        else Path.home() / ".docker" / "config.json"
-    )
+    return Path(config_root) / "config.json" if config_root else Path.home() / ".docker" / "config.json"
 
 
 def _read_docker_config() -> Dict[str, Any]:
@@ -97,11 +93,7 @@ def _docker_config_registry_auths(registries: Set[str]) -> Dict[str, Dict[str, A
     if isinstance(raw_auths, dict):
         for server, auth in raw_auths.items():
             if isinstance(server, str) and isinstance(auth, dict) and _registry_auth_matches(server, registries):
-                auths[server] = {
-                    str(key): value
-                    for key, value in auth.items()
-                    if isinstance(key, str) and value is not None
-                }
+                auths[server] = {str(key): value for key, value in auth.items() if isinstance(key, str) and value is not None}
 
     cred_helpers = payload.get("credHelpers")
     if isinstance(cred_helpers, dict):
@@ -125,21 +117,13 @@ def _docker_config_registry_auths(registries: Set[str]) -> Dict[str, Dict[str, A
                     auths[server] = helper_auth
                     break
 
-    return {
-        server: auth
-        for server, auth in auths.items()
-        if _has_registry_auth_material(auth)
-    }
+    return {server: auth for server, auth in auths.items() if _has_registry_auth_material(auth)}
 
 
 def _has_registry_auth_material(auth: Optional[Dict[str, Any]]) -> bool:
     if not auth:
         return False
-    return bool(
-        auth.get("auth")
-        or auth.get("identitytoken")
-        or (auth.get("username") and auth.get("password"))
-    )
+    return bool(auth.get("auth") or auth.get("identitytoken") or (auth.get("username") and auth.get("password")))
 
 
 def _image_registry(image: str) -> str:
@@ -276,9 +260,7 @@ class ManagerApiClient:
                     body = f": {payload}"
             except Exception:
                 body = ""
-            raise RuntimeError(
-                f"Manager request failed ({method} {path}): HTTP {exc.code}{body}"
-            ) from exc
+            raise RuntimeError(f"Manager request failed ({method} {path}): HTTP {exc.code}{body}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Manager request failed ({method} {path}): {exc.reason}") from exc
         except json.JSONDecodeError as exc:
@@ -295,17 +277,9 @@ class ManagerApiClient:
         values = payload.get("MesudipFeatures")
         features: Set[str] = set()
         if isinstance(values, list):
-            features.update(
-                value.strip()
-                for value in values
-                if isinstance(value, str) and value.strip()
-            )
+            features.update(value.strip() for value in values if isinstance(value, str) and value.strip())
         elif isinstance(values, str):
-            features.update(
-                value.strip()
-                for value in values.split(",")
-                if value.strip()
-            )
+            features.update(value.strip() for value in values.split(",") if value.strip())
         self._features = features
         return set(features)
 
@@ -361,12 +335,8 @@ class ManagerApiClient:
         stack = urllib.parse.quote(stack_name, safe="")
         query = urllib.parse.urlencode({"namespace": namespace})
         if self._detect_manager_backend():
-            return self._request_json(
-                f"/api/docker-stack/stacks/{stack}/versions?{query}"
-            )
-        return self._request_json(
-            f"{self._endpoint_path(f'/inventory/stacks/{stack}/versions')}?{query}"
-        )
+            return self._request_json(f"/api/docker-stack/stacks/{stack}/versions?{query}")
+        return self._request_json(f"{self._endpoint_path(f'/inventory/stacks/{stack}/versions')}?{query}")
 
     def get_stack_compose(
         self,
@@ -384,12 +354,8 @@ class ManagerApiClient:
             params["tag"] = tag
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
         if self._detect_manager_backend():
-            return self._request_json(
-                f"/api/docker-stack/stacks/{stack}/compose{query}"
-            )
-        return self._request_json(
-            f"{self._endpoint_path(f'/inventory/stacks/{stack}/compose')}{query}"
-        )
+            return self._request_json(f"/api/docker-stack/stacks/{stack}/compose{query}")
+        return self._request_json(f"{self._endpoint_path(f'/inventory/stacks/{stack}/compose')}{query}")
 
     def list_nodes(self) -> Dict[str, Any]:
         if self._detect_manager_backend():
@@ -418,12 +384,7 @@ class ManagerApiClient:
 
             nodes.append(
                 {
-                    "hostname": str(
-                        description.get("Hostname")
-                        or spec.get("Name")
-                        or item.get("ID")
-                        or "-"
-                    ),
+                    "hostname": str(description.get("Hostname") or spec.get("Name") or item.get("ID") or "-"),
                     "role": role,
                     "manager_status": manager_status,
                     "state": str(status.get("State") or "-").capitalize(),
@@ -434,8 +395,6 @@ class ManagerApiClient:
             )
 
         return {"nodes": nodes}
-
-
 
     def resolve_config(
         self,

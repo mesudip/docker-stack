@@ -14,10 +14,7 @@ from docker_stack import main
 
 def decode_x_files(compose_content):
     data = yaml.safe_load(compose_content)
-    return {
-        item["path"]: base64.b64decode(item["content"]).decode("utf-8")
-        for item in data.get("x-files", [])
-    }
+    return {item["path"]: base64.b64decode(item["content"]).decode("utf-8") for item in data.get("x-files", [])}
 
 
 class RecordingManager:
@@ -136,15 +133,11 @@ class FakeManagerClient:
         return payload
 
     def deploy_stack(self, *, stack, namespace, compose, options=None):
-        self.deploy_payloads.append(
-            {"stack": stack, "namespace": namespace, "compose": compose, "options": options or {}}
-        )
+        self.deploy_payloads.append({"stack": stack, "namespace": namespace, "compose": compose, "options": options or {}})
         return {"warnings": [], "stdout": "", "stderr": ""}
 
     def rollback_stack(self, *, stack, namespace, version):
-        self.rollback_payloads.append(
-            {"stack": stack, "namespace": namespace, "version": version}
-        )
+        self.rollback_payloads.append({"stack": stack, "namespace": namespace, "version": version})
         return {"warnings": [], "stdout": "", "stderr": ""}
 
 
@@ -396,8 +389,7 @@ def test_rendered_compose_normalizes_main_source_name(monkeypatch, tmp_path):
 
 def test_build_uses_service_dockerfile(tmp_path):
     compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text(
-        """
+    compose_file.write_text("""
 services:
   storybook:
     image: example/storybook:test
@@ -406,8 +398,7 @@ services:
       dockerfile: storybook.Dockerfile
       args:
         NPMRC_TOKEN: dummy
-""".strip()
-    )
+""".strip())
 
     docker = Docker()
     docker.stack.build_and_push(str(compose_file))
@@ -453,15 +444,7 @@ def test_filtered_agent_outputs_still_render(monkeypatch, capsys):
             "config",
             "inspect",
             "team-a_v2",
-        ): json.dumps(
-            [
-                {
-                    "Spec": {
-                        "Data": base64.b64encode(b"services:\n  api:\n    image: busybox\n").decode("utf-8")
-                    }
-                }
-            ]
-        ),
+        ): json.dumps([{"Spec": {"Data": base64.b64encode(b"services:\n  api:\n    image: busybox\n").decode("utf-8")}}]),
         ("docker", "node", "ls", "--format", "{{json .}}"): json.dumps(
             {
                 "ID": "node-1",
