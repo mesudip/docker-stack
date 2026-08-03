@@ -429,10 +429,13 @@ class ManagerApiClient:
                 return False
         return True
 
-    def list_stacks(self) -> Dict[str, Any]:
+    def list_stacks(self, *, namespace: Optional[str] = DEFAULT_NAMESPACE) -> Dict[str, Any]:
+        query = urllib.parse.urlencode(
+            {"namespace": namespace} if namespace is not None else {"all_namespaces": "true"}
+        )
         if self._detect_manager_backend():
-            return self._request_json("/api/docker-stack/stacks")
-        return self._request_json(self._endpoint_path("/inventory/stacks"))
+            return self._request_json(f"/api/docker-stack/stacks?{query}")
+        return self._request_json(f"{self._endpoint_path('/inventory/stacks')}?{query}")
 
     def list_stack_versions(self, stack_name: str, *, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, Any]:
         stack = urllib.parse.quote(stack_name, safe="")

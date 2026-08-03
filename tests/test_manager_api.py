@@ -387,7 +387,10 @@ def test_enterprise_query_uses_direct_manager_fast_paths(monkeypatch):
         calls.append((method, path, payload))
         if path == "/version":
             return {"MesudipFeatures": [FEATURE_MESUDIP_DOCKER_ENTERPRISE]}
-        if path == "/api/docker-stack/stacks":
+        if path in {
+            "/api/docker-stack/stacks?namespace=default",
+            "/api/docker-stack/stacks?all_namespaces=true",
+        }:
             return {"stacks": []}
         if path == "/api/docker-stack/stacks/team-a/versions?namespace=prod":
             return {"versions": []}
@@ -402,13 +405,15 @@ def test_enterprise_query_uses_direct_manager_fast_paths(monkeypatch):
     monkeypatch.setattr(client, "_request_json", fake_request)
 
     assert client.list_stacks() == {"stacks": []}
+    assert client.list_stacks(namespace=None) == {"stacks": []}
     assert client.list_stack_versions("team-a", namespace="prod") == {"versions": []}
     assert client.get_stack_compose("team-a", namespace="prod", tag="latest") == {"compose": "services: {}"}
     assert client.list_nodes() == {"nodes": []}
     assert client.rollback_stack(stack="team-a", namespace="prod", version="2") == {"warnings": []}
     assert calls == [
         ("GET", "/version", None),
-        ("GET", "/api/docker-stack/stacks", None),
+        ("GET", "/api/docker-stack/stacks?namespace=default", None),
+        ("GET", "/api/docker-stack/stacks?all_namespaces=true", None),
         ("GET", "/api/docker-stack/stacks/team-a/versions?namespace=prod", None),
         ("GET", "/api/docker-stack/stacks/team-a/compose?namespace=prod&tag=latest", None),
         ("GET", "/api/docker-stack/nodes", None),

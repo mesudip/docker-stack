@@ -20,12 +20,32 @@ from docker_stack.login import (
     isolated_docker_config_dir,
     is_manager_context,
     merge_docker_config_header,
+    persist_shell_context,
     resolve_login_config,
     resolve_shell_login_config,
     setup_auth,
     switch_docker_context,
     token_issuer_from_jwt,
+    UnknownShellContextError,
 )
+
+
+def test_persist_shell_context_creates_reusable_context_store(monkeypatch, tmp_path):
+    config = DockerManagerLoginConfig(
+        manager_url="https://manager.example.com:2376",
+        context_name="prod1",
+        timeout_secs=30,
+    )
+    configured = []
+    monkeypatch.setattr("docker_stack.login.isolated_docker_config_dir", lambda _name: tmp_path)
+    monkeypatch.setattr("docker_stack.login.ensure_isolated_docker_config", lambda path: path / "config.json")
+    monkeypatch.setattr(
+        "docker_stack.login.configure_docker_context_in_store",
+        lambda _config, path: configured.append(path),
+    )
+
+    assert persist_shell_context(config) == tmp_path
+    assert configured == [tmp_path]
 
 
 def test_merge_docker_config_header_with_empty_config(tmp_path):
@@ -406,6 +426,13 @@ def test_resolve_shell_login_config_uses_persisted_context(monkeypatch):
 def test_resolve_shell_login_config_requires_context_name_for_first_run():
     with pytest.raises(RuntimeError, match="Pass --context <name> when providing a manager target"):
         resolve_shell_login_config(shell_name=None, manager_target="172.31.0.6:2378", context_name=None)
+
+
+def test_resolve_shell_login_config_identifies_unknown_named_context(monkeypatch):
+    monkeypatch.setattr("docker_stack.login.docker_context_target", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(UnknownShellContextError, match="Unknown shell context 'prod1'"):
+        resolve_shell_login_config(shell_name="prod1", manager_target=None, context_name=None)
 
 
 def test_ensure_isolated_login_skips_browser_when_token_is_active(monkeypatch, tmp_path):

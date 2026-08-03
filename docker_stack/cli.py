@@ -19,10 +19,12 @@ from docker_stack.login import (
     ensure_isolated_login,
     format_expiry,
     login as docker_manager_login,
+    persist_shell_context,
     resolve_login_config,
     resolve_shell_login_config,
     setup_auth as docker_manager_setup_auth,
     switch_docker_context,
+    UnknownShellContextError,
 )
 from docker_stack.shell_auth import (
     SHELL_CONTEXT_ENV,
@@ -48,6 +50,55 @@ DOCKER_SHELL_ENDPOINT_ENV_VARS = (
     "DOCKER_API_VERSION",
     "DOCKER_MACHINE_NAME",
 )
+DEFAULT_NAMESPACE = "default"
+
+
+def physical_stack_name(namespace: str, stack: str) -> str:
+    return stack if namespace == DEFAULT_NAMESPACE else f"{namespace}--{stack}"
+
+
+def _namespace_default() -> str:
+    return os.getenv("DOCKER_STACK_NAMESPACE", DEFAULT_NAMESPACE).strip() or DEFAULT_NAMESPACE
+
+
+def _add_namespace_argument(parser: argparse.ArgumentParser, help_text: str = "Stack namespace") -> None:
+    parser.add_argument(
+        "-n",
+        "--namespace",
+        default=_namespace_default(),
+        help=f"{help_text} (default: %(default)s)",
+    )
+
+
+def _add_listing_namespace_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-n",
+        "--namespace",
+        default=_namespace_default(),
+        help="Stack namespace (default: %(default)s)",
+    )
+    group.add_argument(
+        "-A",
+        "--all-namespaces",
+        "-all-namespaces",
+        action="store_true",
+        help="List stacks across all namespaces",
+    )
+
+
+def _prompt_for_manager_target(context_name: str) -> str:
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            f"Unknown shell context '{context_name}'. Run "
+            f"'docker-stack shell --context {context_name} <manager-url>' to create it."
+        )
+    print(f"Docker context '{context_name}' does not exist yet.")
+    print("Enter the Docker-Manager URL to create it (for example https://manager.example.com:2376).")
+    target = input(f"Manager URL for {context_name}: ").strip()
+    if not target:
+        raise RuntimeError(f"Manager URL is required to create shell context '{context_name}'")
+    return target
 
 
 @dataclass
@@ -382,7 +433,13 @@ class DockerStack:
             env_sources.append(content.decode("utf-8", errors="ignore"))
         return x_files, env_sources
 
-    def rendered_compose_file(self, compose_file, stack=None, include_build=True) -> RenderedCompose:
+    def rendered_compose_file(
+        self,
+        compose_file,
+        stack=None,
+        include_build=True,
+        namespace: str = DEFAULT_NAMESPACE,
+    ) -> RenderedCompose:
         compose_path = Path(compose_file).resolve()
         template_bytes = compose_path.read_bytes()
         template_content = template_bytes.decode("utf-8")
@@ -411,11 +468,19 @@ class DockerStack:
         if stack and not manager_deploy:
             if "configs" in compose_data:
                 compose_data["configs"] = self._process_x_content(
-                    compose_data["configs"], self.docker.config, base_dir=str(base_dir), stack=stack
+                    compose_data["configs"],
+                    self.docker.config,
+                    base_dir=str(base_dir),
+                    stack=stack,
+                    namespace=namespace,
                 )
             if "secrets" in compose_data:
                 compose_data["secrets"] = self._process_x_content(
-                    compose_data["secrets"], self.docker.secret, base_dir=str(base_dir), stack=stack
+                    compose_data["secrets"],
+                    self.docker.secret,
+                    base_dir=str(base_dir),
+                    stack=stack,
+                    namespace=namespace,
                 )
 
         # Define the replacements for '$' to '$$' for env variables in compose files
@@ -437,26 +502,38 @@ class DockerStack:
     def decode_yaml(self, data: str) -> dict:
         return yaml.safe_load(data)
 
-    def render_compose_file(self, compose_file, stack=None, include_build=True):
+    def render_compose_file(self, compose_file, stack=None, include_build=True, namespace: str = DEFAULT_NAMESPACE):
         """
         Render the Docker Compose file with environment variables and create Docker configs/secrets.
         """
-        return self.rendered_compose_file(compose_file, stack, include_build=include_build)
+        return self.rendered_compose_file(
+            compose_file,
+            stack,
+            include_build=include_build,
+            namespace=namespace,
+        )
 
-    def _process_x_content(self, objects, manager: DockerObjectManager, base_dir="", stack=None):
+    def _process_x_content(
+        self,
+        objects,
+        manager: DockerObjectManager,
+        base_dir="",
+        stack=None,
+        namespace: str = DEFAULT_NAMESPACE,
+    ):
         """
         Process configs or secrets with x-content keys.
         Returns a tuple: (processed_objects, commands)
         """
         processed_objects = {}
         manager_client = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
-        namespace = os.getenv("DOCKER_STACK_NAMESPACE", "default")
+        object_stack = physical_stack_name(namespace, stack) if stack else None
 
         def docker_object_name_for(name, explicit_name=None):
             if explicit_name:
                 return explicit_name
-            if stack:
-                return f"{stack}_{name}"
+            if object_stack:
+                return f"{object_stack}_{name}"
             return name
 
         def normalize_labels(labels):
@@ -500,7 +577,7 @@ class DockerStack:
                 processed_objects[name] = {"name": response["actual_name"], "external": True}
                 return
 
-            object_name, command = manager.create(docker_object_name, data, labels=labels, stack=stack)
+            object_name, command = manager.create(docker_object_name, data, labels=labels, stack=object_stack)
             if not command.isNop():
                 self.commands.append(command)
                 if is_generated_secret:
@@ -604,16 +681,55 @@ class DockerStack:
     def _version_sort_key(raw: str):
         return int(raw) if raw.isdigit() else raw
 
-    def _print_stack_listing(self, stack_versions: Dict[str, List[str]]) -> None:
-        max_stack_name_length = max(len(stack) for stack in stack_versions) if stack_versions else 10
+    @staticmethod
+    def _compact_versions(versions: List[str]) -> str:
+        numeric = sorted({int(version.lstrip("vV")) for version in versions if version.lstrip("vV").isdigit()})
+        other = sorted({version for version in versions if not version.lstrip("vV").isdigit()})
+        compact = []
+        start = end = None
+
+        def append_range(first: int, last: int) -> None:
+            if last - first >= 2:
+                compact.append(f"v{first}...v{last}")
+            elif last == first:
+                compact.append(f"v{first}")
+            else:
+                compact.extend((f"v{first}", f"v{last}"))
+
+        for version in numeric:
+            if start is None:
+                start = end = version
+            elif version == end + 1:
+                end = version
+            else:
+                append_range(start, end)
+                start = end = version
+        if start is not None:
+            append_range(start, end)
+        compact.extend(other)
+        return ", ".join(compact)
+
+    def _print_stack_listing(self, stack_versions: Dict[Tuple[str, str], List[str]], namespace: Optional[str]) -> None:
+        max_stack_name_length = max((len(stack) for _, stack in stack_versions), default=10)
         header_stack = "Stack Name".ljust(max_stack_name_length)
 
-        print(f"{header_stack} | Versions")
-        print("-" * (max_stack_name_length + 12))
+        if namespace is not None:
+            print(f"Namespace: {namespace}")
+            print(f"{header_stack} | Versions")
+            print("-" * (max_stack_name_length + 12))
+        else:
+            max_namespace_length = max((len(item_namespace) for item_namespace, _ in stack_versions), default=9)
+            header_namespace = "Namespace".ljust(max_namespace_length)
+            print("Namespace: all")
+            print(f"{header_namespace} | {header_stack} | Versions")
+            print("-" * (max_namespace_length + max_stack_name_length + 15))
 
-        for stack, versions in sorted(stack_versions.items()):
-            versions_str = ", ".join(sorted(versions, key=self._version_sort_key))
-            print(f"{stack.ljust(max_stack_name_length)} | {versions_str}")
+        for (item_namespace, stack), versions in sorted(stack_versions.items()):
+            versions_str = self._compact_versions(versions)
+            if namespace is None:
+                print(f"{item_namespace.ljust(max_namespace_length)} | {stack.ljust(max_stack_name_length)} | {versions_str}")
+            else:
+                print(f"{stack.ljust(max_stack_name_length)} | {versions_str}")
 
     def _print_versions(self, versions_list: List[Tuple[str, str]]) -> None:
         rows = [("Version", "Tag")] + versions_list
@@ -626,13 +742,13 @@ class DockerStack:
         for version, tag in sorted(versions_list, key=lambda x: self._version_sort_key(x[0])):
             print(f"{version.ljust(max_version_length)} | {tag.ljust(max_tag_length)}")
 
-    def ls(self):
+    def ls(self, namespace: Optional[str] = DEFAULT_NAMESPACE):
         client = self._manager_client_for_feature(FEATURE_STACK_QUERY)
         if client:
             try:
-                payload = client.list_stacks()
+                payload = client.list_stacks(namespace=namespace)
                 stack_versions = {
-                    str(item.get("stack")): [
+                    (str(item.get("namespace") or namespace or DEFAULT_NAMESPACE), str(item.get("stack"))): [
                         str(version)
                         for version in (
                             item.get("versions") if isinstance(item.get("versions"), list) else item.get("available_versions", [])
@@ -642,7 +758,9 @@ class DockerStack:
                     for item in payload.get("stacks", [])
                     if str(item.get("stack", "")).strip()
                 }
-                self._print_stack_listing(stack_versions)
+                self._print_stack_listing(stack_versions, namespace)
+                if namespace is not None:
+                    return {stack: versions for (_, stack), versions in stack_versions.items()}
                 return stack_versions
             except RuntimeError as exc:
                 self._raise_if_manager_is_explicit(exc)
@@ -650,7 +768,7 @@ class DockerStack:
         cmd = ["docker", "config", "ls", "--format", "{{.ID}}\t{{.Name}}\t{{.Labels}}"]
         raw_output = run_cli_command(cmd, log=False)
         output = raw_output.split("\n") if raw_output else []
-        stack_versions: Dict[str, List[str]] = {}
+        stack_versions: Dict[Tuple[str, str], List[str]] = {}
 
         for line in output:
             parts = line.split("\t")
@@ -658,11 +776,14 @@ class DockerStack:
                 labels = {k: v for k, v in (label.split("=") for label in parts[2].split(",") if "=" in label)}
                 stack_name = labels.get("mesudip.stack.name")
                 version = labels.get("mesudip.object.version", "unknown")
+                object_namespace = labels.get("com.mesudip.namespace", DEFAULT_NAMESPACE)
 
-                if stack_name:
-                    stack_versions.setdefault(stack_name, []).append(version)
+                if stack_name and (namespace is None or object_namespace == namespace):
+                    stack_versions.setdefault((object_namespace, stack_name), []).append(version)
 
-        self._print_stack_listing(stack_versions)
+        self._print_stack_listing(stack_versions, namespace)
+        if namespace is not None:
+            return {stack: versions for (_, stack), versions in stack_versions.items()}
         return stack_versions
 
     def cat(self, name: str, version: str, namespace: str = "default"):
@@ -681,10 +802,11 @@ class DockerStack:
             except RuntimeError as exc:
                 self._raise_if_manager_is_explicit(exc)
 
+        history_name = physical_stack_name(namespace, name)
         if normalized_version == "1":
-            config_name = f"{name}"
+            config_name = history_name
         else:
-            config_name = f"{name}_v{normalized_version}"
+            config_name = f"{history_name}_v{normalized_version}"
 
         cmd = ["docker", "config", "inspect", config_name]
         output = run_cli_command(cmd, log=False)
@@ -730,8 +852,9 @@ class DockerStack:
                 stack = labels.get("mesudip.stack.name")
                 version = labels.get("mesudip.object.version", "unknown")
                 tag = labels.get("mesudip.stack.tag", "")
+                object_namespace = labels.get("com.mesudip.namespace", DEFAULT_NAMESPACE)
 
-                if stack == stack_name:
+                if stack == stack_name and object_namespace == namespace:
                     versions_list.append((version, tag))
 
         if print_output:
@@ -894,11 +1017,17 @@ class DockerStack:
         if force_update:
             raise RuntimeError("--force-update is supported only by the Docker-Manager stack deploy API")
 
-        _, cmd = self.docker.config.increment(stack_name, stored_content, labels=labels, stack=stack_name)
+        physical_stack = physical_stack_name(namespace, stack_name)
+        _, cmd = self.docker.config.increment(
+            physical_stack,
+            stored_content,
+            labels=labels,
+            stack=physical_stack,
+        )
         if not cmd.isNop():
             self.commands.append(cmd)
 
-        cmd = ["docker", "stack", "deploy", "-c", "-", stack_name]
+        cmd = ["docker", "stack", "deploy", "-c", "-", physical_stack]
         if with_registry_auth:
             cmd.insert(3, "--with-registry-auth")
         if prune:
@@ -1059,7 +1188,12 @@ class DockerStack:
         force_update: bool = False,
     ):
         self.generated_secrets = {}  # Reset for each deployment
-        rendered = self.render_compose_file(compose_file, stack=stack_name, include_build=False)
+        rendered = self.render_compose_file(
+            compose_file,
+            stack=stack_name,
+            include_build=False,
+            namespace=namespace,
+        )
         self._deploy(
             stack_name,
             rendered.clean,
@@ -1098,7 +1232,12 @@ class DockerStack:
                 )
             )
             return
-        self.commands.append(Command(["docker", "stack", "rm", stack_name], give_console=True))
+        self.commands.append(
+            Command(
+                ["docker", "stack", "rm", physical_stack_name(namespace, stack_name)],
+                give_console=True,
+            )
+        )
 
     def push(self, compose_file):
         compose_data = self.read_compose_file(compose_file)
@@ -1405,20 +1544,21 @@ def main(args: List[str] = None):
         action="store_true",
         help="Force service task updates (Docker-Manager deploys only)",
     )
-    deploy_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Deployment namespace")
+    _add_namespace_argument(deploy_parser, "Deployment namespace")
     deploy_parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
     deploy_parser.add_argument("--show-generated", action="store_true", default=True, help="Show newly generated secrets after deployment")
 
     # Remove subcommand
     rm_parser = subparsers.add_parser("rm", help="Remove a deployed stack")
     rm_parser.add_argument("stack_name", help="Name of the stack")
-    rm_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
+    _add_namespace_argument(rm_parser)
 
     # Prune command
     subparsers.add_parser("prune", help="Remove old versions of configs and secrets")
 
     # Ls command
-    subparsers.add_parser("ls", help="List docker-stacks")
+    ls_parser = subparsers.add_parser("ls", help="List docker-stacks")
+    _add_listing_namespace_arguments(ls_parser)
 
     node_parser = subparsers.add_parser("node", help="Inspect Docker Swarm nodes")
     node_subparsers = node_parser.add_subparsers(dest="node_command", required=True)
@@ -1429,12 +1569,12 @@ def main(args: List[str] = None):
     )
     cat_parser.add_argument("stack_name", help="Name of the stack")
     cat_parser.add_argument("version", nargs="?", help="Stack version to cat. Defaults to latest if omitted.")
-    cat_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
+    _add_namespace_argument(cat_parser)
 
     checkout_parser = subparsers.add_parser("checkout", help="Deploy specific version of the stack")
     checkout_parser.add_argument("stack_name", help="Name of the stack")
     checkout_parser.add_argument("version", help="Stack version to cat")
-    checkout_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
+    _add_namespace_argument(checkout_parser)
 
     # version_parser = subparsers.add_parser("version",help="Deploy specific version of the stack")
     # version_parser.add_argument("stack_name", help="Name of the stack")
@@ -1442,7 +1582,7 @@ def main(args: List[str] = None):
 
     version_parser = subparsers.add_parser("version", aliases=["versions"], help="Deploy specific version of the stack")
     version_parser.add_argument("stack_name", help="Name of the stack")
-    version_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
+    _add_namespace_argument(version_parser)
 
     parser.add_argument(
         "-u", "--user", help="Registry credentials in format hostname:username:password", action="append", required=False, default=[]
@@ -1513,12 +1653,23 @@ def main(args: List[str] = None):
         shell_name = args.target if args.context_name is None else None
         manager_target = args.target if args.context_name is not None else None
         try:
-            config = resolve_shell_login_config(
-                shell_name=shell_name,
-                manager_target=manager_target,
-                context_name=args.context_name,
-                timeout_secs=args.timeout_secs,
-            )
+            try:
+                config = resolve_shell_login_config(
+                    shell_name=shell_name,
+                    manager_target=manager_target,
+                    context_name=args.context_name,
+                    timeout_secs=args.timeout_secs,
+                )
+            except UnknownShellContextError as exc:
+                manager_target = _prompt_for_manager_target(exc.context_name)
+                print(f"Creating Docker-Manager shell context '{exc.context_name}'...")
+                config = resolve_shell_login_config(
+                    shell_name=None,
+                    manager_target=manager_target,
+                    context_name=exc.context_name,
+                    timeout_secs=args.timeout_secs,
+                )
+                persist_shell_context(config)
             if shell_session_active() and os.getenv(SHELL_CONTEXT_ENV) == config.context_name:
                 print(f"docker-stack shell context={config.context_name} is already active")
                 return
@@ -1586,6 +1737,9 @@ def main(args: List[str] = None):
         docker = Docker(registries=args.user)
         docker.load_env()
 
+        if hasattr(args, "namespace") and args.command != "ls":
+            print(f"Namespace: {args.namespace}", file=sys.stderr)
+
         if args.command == "build":
             docker.stack.build_and_push(args.compose_file, push=args.push)
         elif args.command == "push":
@@ -1604,7 +1758,7 @@ def main(args: List[str] = None):
                 force_update=args.force_update,
             )
         elif args.command == "ls":
-            docker.stack.ls()
+            docker.stack.ls(namespace=None if args.all_namespaces else (args.namespace or DEFAULT_NAMESPACE))
         elif args.command == "node":
             if args.node_command == "ls":
                 docker.node.ls()

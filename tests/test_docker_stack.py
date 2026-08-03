@@ -10,6 +10,7 @@ import yaml
 
 from docker_stack.cli import DOCKER_SHELL_ENDPOINT_ENV_VARS, Docker, active_shell_config_dir, open_context_shell
 from docker_stack.helpers import Command
+from docker_stack.login import UnknownShellContextError
 from docker_stack import main
 
 
@@ -45,8 +46,8 @@ class FakeManagerClient:
     def supports(self, feature_name):
         return feature_name in self.features
 
-    def list_stacks(self):
-        return {"stacks": [{"stack": "team-a", "versions": ["1", "2"]}]}
+    def list_stacks(self, *, namespace="default"):
+        return {"stacks": [{"namespace": namespace or "default", "stack": "team-a", "versions": ["1", "2"]}]}
 
     def list_stack_versions(self, stack_name, *, namespace="default"):
         assert stack_name == "team-a"
@@ -514,6 +515,61 @@ def test_manager_fast_path_for_list_and_node(monkeypatch, capsys):
     assert "manager (Leader)" in output
 
 
+def test_stack_listing_compacts_consecutive_versions(capsys):
+    Docker().stack._print_stack_listing(
+        {("default", "api"): [str(version) for version in range(1, 61)]},
+        "default",
+    )
+
+    output = capsys.readouterr().out
+    assert "Namespace: default" in output
+    assert "v1...v60" in output
+    assert "v1, v2" not in output
+
+
+def test_ls_supports_namespace_short_flag_and_all_namespaces(monkeypatch, capsys):
+    class NamespaceManager(FakeManagerClient):
+        def list_stacks(self, *, namespace="default"):
+            if namespace is None:
+                return {
+                    "stacks": [
+                        {"namespace": "default", "stack": "api", "versions": ["1", "2", "3"]},
+                        {"namespace": "prod", "stack": "api", "versions": ["1"]},
+                    ]
+                }
+            return {"stacks": [{"namespace": namespace, "stack": "api", "versions": ["1"]}]}
+
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: NamespaceManager())
+
+    main(["ls", "-n", "prod"])
+    namespace_output = capsys.readouterr().out
+    assert "Namespace: prod" in namespace_output
+
+    main(["ls", "-A"])
+    all_output = capsys.readouterr().out
+    assert "Namespace: all" in all_output
+    assert "default" in all_output
+    assert "prod" in all_output
+    assert "v1...v3" in all_output
+
+
+def test_raw_daemon_namespace_uses_physical_stack_name(monkeypatch):
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    docker = Docker()
+    captured = {}
+
+    def fake_increment(object_name, content, labels=None, stack=None):
+        captured.update(object_name=object_name, content=content, labels=labels, stack=stack)
+        return object_name, Command.nop
+
+    monkeypatch.setattr(docker.config, "increment", fake_increment)
+    docker.stack._deploy("api", "services: {}", namespace="prod")
+
+    assert captured["object_name"] == "prod--api"
+    assert captured["stack"] == "prod--api"
+    assert docker.stack.commands[-1].command[-1] == "prod--api"
+
+
 def test_cat_without_explicit_version_does_not_print_versions_table(monkeypatch, capsys):
     fake_manager = FakeManagerClient()
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
@@ -687,7 +743,7 @@ def test_manager_deploy_prints_generated_secret_values(capsys):
 
 def test_explicit_manager_query_error_does_not_fall_back_to_daemon(monkeypatch):
     class FailingManager(FakeManagerClient):
-        def list_stacks(self):
+        def list_stacks(self, *, namespace="default"):
             raise RuntimeError("Manager request failed (GET /api/docker-stack/stacks): HTTP 503")
 
     monkeypatch.setenv("DOCKER_MANAGER_URL", "https://manager.example.test:2378")
@@ -1074,6 +1130,41 @@ def test_shell_authenticates_and_opens_managed_shell(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "Opening shell context=office" in output
     assert "Shell manager=https://172.31.0.6:2378" in output
+
+
+def test_shell_unknown_context_prompts_for_manager_url_and_creates_it(monkeypatch, capsys):
+    calls = []
+
+    def fake_resolve_shell_login_config(**kwargs):
+        calls.append(kwargs)
+        if kwargs["manager_target"] is None:
+            raise UnknownShellContextError("prod1")
+        return SimpleNamespace(
+            manager_url="https://manager.example.com:2376",
+            context_name="prod1",
+            docker_context_host="tcp://manager.example.com:2376",
+            skip_tls_verify=False,
+            timeout_secs=30,
+        )
+
+    monkeypatch.setattr("docker_stack.cli.resolve_shell_login_config", fake_resolve_shell_login_config)
+    monkeypatch.setattr("docker_stack.cli.sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "https://manager.example.com:2376")
+    persisted = []
+    monkeypatch.setattr("docker_stack.cli.persist_shell_context", lambda config: persisted.append(config.context_name))
+    monkeypatch.setattr("docker_stack.cli.browser_login", lambda _config: None)
+    monkeypatch.setattr("docker_stack.cli.run_managed_shell", lambda _config, _result: 0)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["shell", "prod1"])
+
+    assert excinfo.value.code == 0
+    assert calls[1]["context_name"] == "prod1"
+    assert calls[1]["manager_target"] == "https://manager.example.com:2376"
+    assert persisted == ["prod1"]
+    output = capsys.readouterr().out
+    assert "Docker context 'prod1' does not exist yet" in output
+    assert "Creating Docker-Manager shell context 'prod1'" in output
 
 
 def test_shell_inside_same_context_reports_already_active(monkeypatch, capsys):

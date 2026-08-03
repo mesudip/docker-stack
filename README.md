@@ -21,6 +21,8 @@ Typical daemon-only workflow:
 ```bash
 docker-stack deploy my-stack docker-compose.yml
 docker-stack ls
+docker-stack ls -n team-a
+docker-stack ls -A
 docker-stack versions my-stack
 docker-stack cat my-stack
 docker-stack checkout my-stack v2
@@ -125,6 +127,14 @@ Open an isolated Bash or Zsh session for a manager context:
 ```bash
 docker-stack shell office
 ```
+
+If `office` does not exist yet, the CLI asks for its Docker-Manager URL, creates
+the context, authenticates, and opens the shell. You can also provide everything
+non-interactively with `docker-stack shell --context office <manager-url>`.
+
+Stack commands use the `default` namespace unless `-n/--namespace` is supplied.
+Listings print the selected namespace; `docker-stack ls -A` (or
+`--all-namespaces`) lists every visible namespace.
 
 The prompt displays `(docker:office)`, keeps the selected manager context active,
 and refreshes authentication when needed. The session supports `docker` and

@@ -60,6 +60,12 @@ class DockerManagerSetupAuthResult:
     validation_skipped: bool = False
 
 
+class UnknownShellContextError(RuntimeError):
+    def __init__(self, context_name: str):
+        self.context_name = context_name
+        super().__init__(f"Unknown shell context '{context_name}'")
+
+
 def normalize_loopback_host(url: str) -> str:
     if "127.0.0.1" in url:
         return url.replace("127.0.0.1", "localhost")
@@ -343,10 +349,7 @@ def resolve_shell_login_config(
         )
         target = persisted_target or docker_context_target(resolved_context_name)
         if not target:
-            raise RuntimeError(
-                f"Unknown shell context '{resolved_context_name}'. First run "
-                f"'docker-stack shell --context {resolved_context_name} <manager-host>'."
-            )
+            raise UnknownShellContextError(resolved_context_name)
         resolved_manager_url, skip_tls_verify = detect_manager_url(target)
         return DockerManagerLoginConfig(
             manager_url=resolved_manager_url,
@@ -616,6 +619,13 @@ def configure_docker_context_in_store(config: DockerManagerLoginConfig, docker_c
     result = subprocess.run(base_command, text=True, capture_output=True, check=False, env=env)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "failed to configure docker context").strip())
+
+
+def persist_shell_context(config: DockerManagerLoginConfig) -> Path:
+    config_dir = isolated_docker_config_dir(config.context_name)
+    ensure_isolated_docker_config(config_dir)
+    configure_docker_context_in_store(config, config_dir)
+    return config_dir
 
 
 def ensure_isolated_login(
