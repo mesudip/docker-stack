@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, Set
 import yaml
 
 from docker_stack.login import current_docker_context_target, resolve_login_config
+from docker_stack.shell_auth import ensure_shell_access
 
 FEATURE_MESUDIP_DOCKER_ENTERPRISE = "mesudip-docker-enterprise-v1"
 FEATURE_STACK_QUERY = "docker_stack_query_v1"
@@ -182,6 +183,20 @@ def _public_deploy_options(options: Optional[Dict[str, Any]], compose: str) -> O
     return prepared
 
 
+def _public_image_deploy_options(options: Optional[Dict[str, Any]], images: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    prepared = dict(options or {})
+    if prepared.get("with_registry_auth"):
+        registries = {
+            _image_registry(image.strip())
+            for image in images.values()
+            if isinstance(image, str) and image.strip()
+        }
+        registry_auth = _docker_config_registry_auths(registries)
+        if registry_auth:
+            prepared["registry_auth"] = registry_auth
+    return prepared or {}
+
+
 def _env_timeout_secs(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -250,6 +265,10 @@ class ManagerApiClient:
         self._is_manager_backend = False
         self._backend_checked = False
 
+    def _request_headers(self) -> Dict[str, str]:
+        ensure_shell_access()
+        return {**self.default_headers, **_docker_config_headers()}
+
     def _request_json(
         self,
         path: str,
@@ -259,7 +278,7 @@ class ManagerApiClient:
         timeout_secs: Optional[int] = None,
     ) -> Any:
         url = f"{self.manager_url}{path}"
-        headers = {**self.default_headers}
+        headers = self._request_headers()
         data = None
         if payload is not None:
             headers["Content-Type"] = "application/json"
@@ -297,7 +316,7 @@ class ManagerApiClient:
         timeout_secs: Optional[int] = None,
     ):
         url = f"{self.manager_url}{path}"
-        headers = {**self.default_headers, "Accept": "text/event-stream"}
+        headers = {**self._request_headers(), "Accept": "text/event-stream"}
         data = None
         if payload is not None:
             headers["Content-Type"] = "application/json"
@@ -357,11 +376,7 @@ class ManagerApiClient:
     def detect_features(self) -> Set[str]:
         if self._features is not None:
             return set(self._features)
-        try:
-            payload = self._request_json("/version")
-        except RuntimeError:
-            self._features = set()
-            return set()
+        payload = self._request_json("/version")
         values = payload.get("MesudipFeatures")
         features: Set[str] = set()
         if isinstance(values, list):
@@ -572,6 +587,42 @@ class ManagerApiClient:
             timeout_secs=_manager_deploy_timeout_secs(self.timeout_secs),
         )
 
+    def deploy_stack_images(
+        self,
+        *,
+        stack: str,
+        namespace: str,
+        images: Dict[str, str],
+        options: Optional[Dict[str, Any]] = None,
+        on_event=None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "stack": stack,
+            "namespace": namespace,
+            "images": images,
+        }
+        prepared_options = _public_image_deploy_options(options, images)
+        if prepared_options:
+            payload["options"] = prepared_options
+
+        done: Optional[Dict[str, Any]] = None
+        for event in self._request_sse_events(
+            "/api/stacks/deploy/images",
+            method="POST",
+            payload=payload,
+            timeout_secs=_manager_deploy_timeout_secs(self.timeout_secs),
+        ):
+            if on_event:
+                on_event(event)
+            event_name = event.get("event")
+            data = event.get("data")
+            if event_name == "error":
+                message = data.get("message") if isinstance(data, dict) else str(data)
+                raise RuntimeError(message or "manager image deploy stream failed")
+            if event_name == "done" and isinstance(data, dict):
+                done = data
+        return done or {"warnings": [], "stdout": "", "stderr": ""}
+
     def deploy_stack_stream(
         self,
         *,
@@ -616,6 +667,19 @@ class ManagerApiClient:
             self._endpoint_path(f"/inventory/stacks/{quoted_stack}/rollback"),
             method="POST",
             payload={"namespace": namespace, "version": version},
+        )
+
+    def remove_stack(self, *, stack: str, namespace: str = DEFAULT_NAMESPACE) -> Dict[str, Any]:
+        quoted_stack = urllib.parse.quote(stack, safe="")
+        query = urllib.parse.urlencode({"namespace": namespace})
+        if self._detect_manager_backend():
+            return self._request_json(
+                f"/api/stacks/{quoted_stack}?{query}",
+                method="DELETE",
+            )
+        return self._request_json(
+            f"{self._endpoint_path(f'/stacks/{quoted_stack}')}?{query}",
+            method="DELETE",
         )
 
 

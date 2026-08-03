@@ -15,6 +15,7 @@ import json
 from docker_stack.docker_objects import DockerConfig, DockerObjectManager, DockerSecret
 from docker_stack.helpers import CallbackCommand, Command, generate_secret, run_cli_command
 from docker_stack.login import (
+    browser_login,
     ensure_isolated_login,
     format_expiry,
     login as docker_manager_login,
@@ -22,6 +23,14 @@ from docker_stack.login import (
     resolve_shell_login_config,
     setup_auth as docker_manager_setup_auth,
     switch_docker_context,
+)
+from docker_stack.shell_auth import (
+    SHELL_CONTEXT_ENV,
+    ShellAuthError,
+    ensure_shell_access,
+    login_for_active_shell,
+    run_managed_shell,
+    shell_session_active,
 )
 from docker_stack.manager_api import (
     FEATURE_STACK_DEPLOY,
@@ -323,13 +332,36 @@ class DockerStack:
         content = ("\n".join(lines) + "\n").encode("utf-8")
         return {"path": ".env", "content": self._b64_content(content)}
 
+    def _prepare_manager_secret_sources(self, compose_data: dict, base_dir: Path) -> None:
+        secrets = compose_data.get("secrets", {})
+        if not isinstance(secrets, dict):
+            return
+        for name, details in secrets.items():
+            if not isinstance(details, dict):
+                continue
+            if "x-template-file" in details:
+                filename = base_dir / details["x-template-file"]
+                details["x-content"] = envsubst_load_file(str(filename), os.environ)
+                details.pop("x-template-file", None)
+            elif "file" in details:
+                filename = base_dir / details["file"]
+                details["x-content"] = filename.read_text(encoding="utf-8")
+                details.pop("file", None)
+            elif "environment" in details:
+                env_name = str(details["environment"]).strip()
+                env_value = os.environ.get(env_name)
+                if env_value in (None, ""):
+                    raise ValueError(f"Secret {name} references environment variable {env_name}, but it is not set.")
+                details["x-content"] = env_value
+                details.pop("environment", None)
+
     def _collect_config_source_files(self, compose_data: dict, base_dir: Path) -> Tuple[List[Dict[str, str]], List[str]]:
         x_files = []
         env_sources = []
+        seen_paths = set()
         configs = compose_data.get("configs", {})
         if not isinstance(configs, dict):
             return x_files, env_sources
-
         for details in configs.values():
             if not isinstance(details, dict):
                 continue
@@ -337,13 +369,16 @@ class DockerStack:
             if not source_path:
                 continue
             filename = (base_dir / source_path).resolve()
+            relative_path = self._relative_source_name(filename, base_dir)
             content = filename.read_bytes()
-            x_files.append(
-                {
-                    "path": self._relative_source_name(filename, base_dir),
-                    "content": self._b64_content(content),
-                }
-            )
+            if relative_path not in seen_paths:
+                x_files.append(
+                    {
+                        "path": relative_path,
+                        "content": self._b64_content(content),
+                    }
+                )
+                seen_paths.add(relative_path)
             env_sources.append(content.decode("utf-8", errors="ignore"))
         return x_files, env_sources
 
@@ -357,6 +392,9 @@ class DockerStack:
         source_x_files: List[Dict[str, str]] = []
         env_sources = [template_content]
         secret_env_vars = self._secret_environment_vars(compose_data)
+        manager_deploy = self._manager_client_for_feature(FEATURE_STACK_DEPLOY) if stack else None
+        if manager_deploy:
+            self._prepare_manager_secret_sources(compose_data, base_dir)
         if stack:
             source_x_files, config_env_sources = self._collect_config_source_files(compose_data, base_dir)
             env_sources.extend(config_env_sources)
@@ -365,7 +403,12 @@ class DockerStack:
             for k, v in services.items():
                 if "build" in v:
                     del v["build"]
-        if stack:
+        # A manager-backed deploy must send portable source definitions to the
+        # stack API. The manager owns validation, config/secret versioning and
+        # materialization; resolving those objects here can mutate a dry-run and
+        # can pin a service to an old physical object name. Raw daemon deploys
+        # keep the legacy client-side materialization path.
+        if stack and not manager_deploy:
             if "configs" in compose_data:
                 compose_data["configs"] = self._process_x_content(
                     compose_data["configs"], self.docker.config, base_dir=str(base_dir), stack=stack
@@ -547,6 +590,11 @@ class DockerStack:
         return None
 
     @staticmethod
+    def _raise_if_manager_is_explicit(exc: RuntimeError) -> None:
+        if os.getenv("DOCKER_MANAGER_URL", "").strip():
+            raise exc
+
+    @staticmethod
     def _normalize_version(value: str) -> str:
         if value.startswith("v") or value.startswith("V"):
             return value[1:]
@@ -596,8 +644,8 @@ class DockerStack:
                 }
                 self._print_stack_listing(stack_versions)
                 return stack_versions
-            except RuntimeError:
-                pass
+            except RuntimeError as exc:
+                self._raise_if_manager_is_explicit(exc)
 
         cmd = ["docker", "config", "ls", "--format", "{{.ID}}\t{{.Name}}\t{{.Labels}}"]
         raw_output = run_cli_command(cmd, log=False)
@@ -630,8 +678,8 @@ class DockerStack:
                 compose = payload.get("compose")
                 if isinstance(compose, str):
                     return compose
-            except RuntimeError:
-                pass
+            except RuntimeError as exc:
+                self._raise_if_manager_is_explicit(exc)
 
         if normalized_version == "1":
             config_name = f"{name}"
@@ -667,8 +715,8 @@ class DockerStack:
                 if print_output:
                     self._print_versions(versions_list)
                 return versions_list
-            except RuntimeError:
-                pass
+            except RuntimeError as exc:
+                self._raise_if_manager_is_explicit(exc)
 
         cmd = ["docker", "config", "ls", "--format", "{{.Name}}\t{{.Labels}}"]
         raw_output = run_cli_command(cmd, log=False)
@@ -716,7 +764,8 @@ class DockerStack:
             if not rollback_version and tag:
                 try:
                     versions_payload = manager_query.list_stack_versions(stack_name, namespace=namespace) if manager_query else {}
-                except RuntimeError:
+                except RuntimeError as exc:
+                    self._raise_if_manager_is_explicit(exc)
                     versions_payload = {}
                 for item in versions_payload.get("versions", []):
                     if str(item.get("tag", "")) == tag:
@@ -753,7 +802,8 @@ class DockerStack:
                 resolved = payload.get("version")
                 if isinstance(resolved, str) and resolved.strip():
                     version = resolved
-            except RuntimeError:
+            except RuntimeError as exc:
+                self._raise_if_manager_is_explicit(exc)
                 compose_content = None
 
         if compose_content is None:
@@ -786,6 +836,9 @@ class DockerStack:
         tag=None,
         namespace: str = "default",
         dry_run: bool = False,
+        prune: bool = False,
+        resolve_image: Optional[str] = None,
+        force_update: bool = False,
     ):
         stored_content = stored_content if stored_content is not None else rendered_content
         labels = [
@@ -797,7 +850,19 @@ class DockerStack:
             labels.append(f"mesudip.stack.tag={tag}")
 
         manager_deploy = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
-        manager_options = {"with_registry_auth": with_registry_auth} if with_registry_auth else {}
+        if manager_deploy and tag:
+            raise RuntimeError(
+                "Docker-Manager stack deploy does not expose deployment tags; refusing to silently ignore --tag"
+            )
+        manager_options = {}
+        if with_registry_auth:
+            manager_options["with_registry_auth"] = True
+        if prune:
+            manager_options["prune"] = True
+        if resolve_image:
+            manager_options["resolve_image"] = resolve_image
+        if force_update:
+            manager_options["force_update"] = True
         if manager_deploy and dry_run:
             self._validate_via_manager(
                 manager_deploy,
@@ -826,6 +891,9 @@ class DockerStack:
             )
             return
 
+        if force_update:
+            raise RuntimeError("--force-update is supported only by the Docker-Manager stack deploy API")
+
         _, cmd = self.docker.config.increment(stack_name, stored_content, labels=labels, stack=stack_name)
         if not cmd.isNop():
             self.commands.append(cmd)
@@ -833,6 +901,10 @@ class DockerStack:
         cmd = ["docker", "stack", "deploy", "-c", "-", stack_name]
         if with_registry_auth:
             cmd.insert(3, "--with-registry-auth")
+        if prune:
+            cmd.insert(3, "--prune")
+        if resolve_image:
+            cmd[3:3] = ["--resolve-image", resolve_image]
         self.commands.append(Command(cmd, stdin=rendered_content, give_console=True))
 
     @staticmethod
@@ -904,6 +976,17 @@ class DockerStack:
             print(stdout.rstrip())
         if isinstance(stderr, str) and stderr.strip():
             print(stderr.rstrip())
+        generated_secrets = payload.get("generated_secrets") or []
+        if generated_secrets:
+            print("\n----- Newly Generated Secrets -----")
+            for item in generated_secrets:
+                if not isinstance(item, dict):
+                    continue
+                logical_name = str(item.get("logical_name") or item.get("actual_name") or "secret")
+                value = item.get("value")
+                if value is not None:
+                    print(f"{logical_name}: {value}")
+            print("---------------------------------\n")
         return None
 
     @staticmethod
@@ -971,6 +1054,9 @@ class DockerStack:
         show_generated=True,
         namespace: str = "default",
         dry_run: bool = False,
+        prune: bool = False,
+        resolve_image: Optional[str] = None,
+        force_update: bool = False,
     ):
         self.generated_secrets = {}  # Reset for each deployment
         rendered = self.render_compose_file(compose_file, stack=stack_name, include_build=False)
@@ -982,6 +1068,9 @@ class DockerStack:
             tag=tag,
             namespace=namespace,
             dry_run=dry_run,
+            prune=prune,
+            resolve_image=resolve_image,
+            force_update=force_update,
         )
 
         if show_generated and self.generated_secrets:
@@ -999,7 +1088,16 @@ class DockerStack:
         if self.docker.secret:
             self.commands.extend(self.docker.secret.prune(keep=5))
 
-    def rm(self, stack_name):
+    def rm(self, stack_name, namespace: str = "default"):
+        manager = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
+        if manager:
+            self.commands.append(
+                CallbackCommand(
+                    f"docker-manager stack rm {stack_name}",
+                    lambda: manager.remove_stack(stack=stack_name, namespace=namespace),
+                )
+            )
+            return
         self.commands.append(Command(["docker", "stack", "rm", stack_name], give_console=True))
 
     def push(self, compose_file):
@@ -1126,8 +1224,8 @@ class DockerNode:
                     )
                 DockerNode._print_rows(rows)
                 return rows
-            except RuntimeError:
-                pass
+            except RuntimeError as exc:
+                self.docker.stack._raise_if_manager_is_explicit(exc)
 
         nodes_output = run_cli_command(["docker", "node", "ls", "--format", "{{json .}}"], log=False)
         rows = []
@@ -1256,7 +1354,7 @@ def main(args: List[str] = None):
     login_parser.add_argument("--context", "--context-name", dest="context_name", help="Docker context name to create or update")
     login_parser.add_argument("--timeout-secs", type=int, help="Login timeout in seconds")
 
-    shell_parser = subparsers.add_parser("shell", help="Open an isolated bash shell for a Docker-Manager context")
+    shell_parser = subparsers.add_parser("shell", help="Open an authenticated Bash/Zsh shell for a Docker-Manager context")
     shell_parser.add_argument("target", nargs="?", help="Context name, or manager host/URL when used with --context")
     shell_parser.add_argument("--context", "--context-name", dest="context_name", help="Shell context name to create or reuse")
     shell_parser.add_argument("--timeout-secs", type=int, help="Login timeout in seconds")
@@ -1279,6 +1377,9 @@ def main(args: List[str] = None):
     setup_auth_parser.add_argument("--github-oidc-token", help="GitHub OIDC token for trusted publishing")
     setup_auth_parser.add_argument("--verify-ssl", action="store_true", help=argparse.SUPPRESS)
 
+    shell_auth_parser = subparsers.add_parser("shell-auth", help=argparse.SUPPRESS)
+    shell_auth_parser.add_argument("operation", choices=("ensure", "status"), help=argparse.SUPPRESS)
+
     # Build subcommand
     build_parser = subparsers.add_parser("build", help="Build images using docker-compose")
     build_parser.add_argument("compose_file", help="Path to the compose file")
@@ -1293,6 +1394,17 @@ def main(args: List[str] = None):
     deploy_parser.add_argument("stack_name", help="Name of the stack")
     deploy_parser.add_argument("compose_file", help="Path to the compose file")
     deploy_parser.add_argument("--with-registry-auth", action="store_true", help="Use registry authentication")
+    deploy_parser.add_argument("--prune", action="store_true", help="Remove services no longer referenced by the compose file")
+    deploy_parser.add_argument(
+        "--resolve-image",
+        choices=("always", "changed", "never"),
+        help="Control image digest resolution during deploy",
+    )
+    deploy_parser.add_argument(
+        "--force-update",
+        action="store_true",
+        help="Force service task updates (Docker-Manager deploys only)",
+    )
     deploy_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Deployment namespace")
     deploy_parser.add_argument("-t", "--tag", help="Tag the current deployment for later checkout", required=False)
     deploy_parser.add_argument("--show-generated", action="store_true", default=True, help="Show newly generated secrets after deployment")
@@ -1300,6 +1412,7 @@ def main(args: List[str] = None):
     # Remove subcommand
     rm_parser = subparsers.add_parser("rm", help="Remove a deployed stack")
     rm_parser.add_argument("stack_name", help="Name of the stack")
+    rm_parser.add_argument("--namespace", default=os.getenv("DOCKER_STACK_NAMESPACE", "default"), help="Stack namespace")
 
     # Prune command
     subparsers.add_parser("prune", help="Remove old versions of configs and secrets")
@@ -1342,6 +1455,22 @@ def main(args: List[str] = None):
 
     args = parser.parse_args(args if args else sys.argv[1:])
 
+    if args.command == "shell-auth":
+        try:
+            if args.operation == "ensure":
+                ensure_shell_access(required=True)
+            else:
+                from docker_stack.shell_auth import shell_auth_request
+
+                payload = shell_auth_request("status", required=True)
+                print(json.dumps(payload))
+        except ShellAuthError as exc:
+            print(f"docker-stack shell-auth: {exc}", file=sys.stderr)
+            if exc.requires_login:
+                print("Run: docker-stack login", file=sys.stderr)
+            return 2
+        return 0
+
     if args.command == "login":
         try:
             config = resolve_login_config(
@@ -1351,7 +1480,10 @@ def main(args: List[str] = None):
                 timeout_secs=args.timeout_secs,
             )
             current_shell_config = active_shell_config_dir(config.context_name)
-            if current_shell_config:
+            if shell_session_active():
+                result = login_for_active_shell(config)
+                config_dir = current_shell_config
+            elif current_shell_config:
                 config_dir, result = ensure_isolated_login(config, docker_config_dir=current_shell_config)
             else:
                 config_dir = None
@@ -1387,24 +1519,26 @@ def main(args: List[str] = None):
                 context_name=args.context_name,
                 timeout_secs=args.timeout_secs,
             )
-            existing_shell_config = active_shell_config_dir(config.context_name)
-            config_dir, result = ensure_isolated_login(config)
+            if shell_session_active() and os.getenv(SHELL_CONTEXT_ENV) == config.context_name:
+                print(f"docker-stack shell context={config.context_name} is already active")
+                return
+            result = browser_login(config)
         except RuntimeError as exc:
             print(f"docker-stack shell: {exc}", file=sys.stderr)
             sys.exit(2)
-        if existing_shell_config:
-            print(f"Refreshing current shell context={config.context_name}")
-        else:
-            print(f"Opening shell context={config.context_name}")
+        print(f"Opening shell context={config.context_name}")
         print(f"Shell manager={config.manager_url}")
-        print(f"DOCKER_CONFIG={config_dir}")
         if result is not None:
             expiry = format_expiry(result.expires_at)
             if expiry:
                 print(f"Access token expires in {expiry}")
         else:
             print("Access token already active.")
-        sys.exit(open_context_shell(config_dir, config.context_name))
+        try:
+            sys.exit(run_managed_shell(config, result))
+        except ShellAuthError as exc:
+            print(f"docker-stack shell: {exc}", file=sys.stderr)
+            sys.exit(2)
 
     if args.command == "setup-auth":
         try:
@@ -1465,6 +1599,9 @@ def main(args: List[str] = None):
                 show_generated=args.show_generated,
                 namespace=args.namespace,
                 dry_run=args.ro,
+                prune=args.prune,
+                resolve_image=args.resolve_image,
+                force_update=args.force_update,
             )
         elif args.command == "ls":
             docker.stack.ls()
@@ -1473,7 +1610,7 @@ def main(args: List[str] = None):
                 docker.node.ls()
 
         elif args.command == "rm":
-            docker.stack.rm(args.stack_name)
+            docker.stack.rm(args.stack_name, namespace=args.namespace)
         elif args.command == "prune":
             docker.stack.prune()
         elif args.command == "cat":

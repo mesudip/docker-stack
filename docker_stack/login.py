@@ -45,6 +45,8 @@ class DockerManagerLoginResult:
     redirect_uri: str
     callback_port: int
     expires_at: Optional[int]
+    refresh_token: Optional[str] = None
+    refresh_expires_at: Optional[int] = None
 
 
 @dataclass
@@ -791,11 +793,25 @@ def browser_login(
             urlopen=urlopen,
         )
         access_token = str(token_response["access_token"])
+        expires_in = token_response.get("expires_in")
+        expires_at = token_exp_from_jwt(access_token)
+        if expires_at is None and isinstance(expires_in, int) and expires_in > 0:
+            expires_at = int(time.time()) + expires_in
+        refresh_token = token_response.get("refresh_token")
+        refresh_token = str(refresh_token) if isinstance(refresh_token, str) and refresh_token.strip() else None
+        refresh_expires_in = token_response.get("refresh_expires_in")
+        refresh_expires_at = (
+            int(time.time()) + int(refresh_expires_in)
+            if isinstance(refresh_expires_in, int) and refresh_expires_in > 0
+            else None
+        )
         return DockerManagerLoginResult(
             access_token=access_token,
+            refresh_token=refresh_token,
             redirect_uri=redirect_uri,
             callback_port=callback_port,
-            expires_at=token_exp_from_jwt(access_token),
+            expires_at=expires_at,
+            refresh_expires_at=refresh_expires_at,
         )
     finally:
         server.shutdown()

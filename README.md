@@ -52,11 +52,15 @@ steps:
   - run: docker-stack deploy my-stack docker-compose.yml
 ```
 
-This uses the normal Docker CLI path and runs `docker config` / `docker stack deploy` against the configured daemon.
+Use this option when CI can connect directly to the target Docker daemon.
 
 #### 2. Docker-Manager
 
 Use the bundled action when deploying through Docker-Manager:
+
+For a full compose deployment directly from CI, use the action to configure
+Docker-Manager authentication and then run the normal `docker-stack deploy`
+command:
 
 ```yaml
 permissions:
@@ -68,10 +72,64 @@ steps:
   - uses: mesudip/docker-stack@v2
     with:
       manager: https://manager.example.com:2378
-  - run: docker-stack deploy --with-registry-auth my-stack docker-compose.yml
+  - run: docker-stack deploy --namespace team-a --with-registry-auth my-stack docker-compose.yml
 ```
 
-The action uses `actions/setup-python@v6`, installs `docker-stack`, defaults to GitHub OIDC auth and the `dm-proxy` context, exports `DOCKER_CONFIG`, `DOCKER_CONTEXT`, and `DOCKER_MANAGER_URL` for later steps, and removes its generated Docker config directory in the post-action cleanup phase.
+You can also deploy the full compose file through action inputs:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: mesudip/docker-stack@v2
+    with:
+      manager: https://manager.example.com:2378
+      stack: my-stack
+      compose-file: docker-compose.yml
+      namespace: team-a
+      with-registry-auth: "true"
+```
+
+To release new service images without submitting the compose file again:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: mesudip/docker-stack@v2
+    with:
+      manager: https://manager.example.com:2378
+      stack: my-stack
+      namespace: team-a
+      with-registry-auth: "true"
+      images: |
+        api=ghcr.io/acme/api:${{ github.sha }}
+        worker=ghcr.io/acme/worker:${{ github.sha }}
+```
+
+Use a full compose deployment when the workflow owns the complete stack
+definition. Use an image-only deployment when the stack is already managed and
+the workflow only needs to release new images. Both forms support namespaces;
+the namespace defaults to `default` when omitted.
+
+### Authenticated Docker-Manager shell
+
+Open an isolated Bash or Zsh session for a manager context:
+
+```bash
+docker-stack shell office
+```
+
+The prompt displays `(docker:office)`, keeps the selected manager context active,
+and refreshes authentication when needed. The session supports `docker` and
+`docker compose`; legacy `docker-compose` is not supported. If authentication
+expires, run `docker-stack login` again.
 
 ## Core Capabilities
 
@@ -149,9 +207,6 @@ Vanilla Docker Stack deployments can sometimes lack the flexibility needed for d
 
     ### Stored Source Metadata
     Versioned stack configs include a top-level `x-files` list with base64-encoded source material for recovery and auditing. This includes the original compose file as `compose.yml`, a generated `.env` containing referenced non-secret environment values, and config files referenced by `configs.*.file` or `configs.*.x-template-file`. Secret source files and variables used by `secrets.*.environment` are not stored in `x-files`.
-
-    ### Known Issues
-    Stored `x-files` metadata is written into Docker configs during local deploys. Docker config content is limited to 500 KB, and base64-encoded source files add roughly 33% overhead, so stacks with large compose/config source files can exceed the Docker config payload limit even when the rendered compose is valid.
 
     ### `x-generate`: Dynamic Secret Generation (Secrets Only)
     This powerful feature allows you to automatically generate random secrets based on specified criteria, eliminating the need to manually create and manage them. This is particularly useful for passwords, API keys, and other sensitive data.
@@ -255,6 +310,11 @@ Vanilla Docker Stack deployments can sometimes lack the flexibility needed for d
               special: false
               uppercase: false
         ```
+
+## Known Limitations
+
+Docker limits config content to 500 KB. Stack history includes encoded source
+files, so stacks with large compose or config files can exceed that limit.
 
 ## Development
 

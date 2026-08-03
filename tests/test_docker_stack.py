@@ -141,6 +141,10 @@ class FakeManagerClient:
         self.rollback_payloads.append({"stack": stack, "namespace": namespace, "version": version})
         return {"warnings": [], "stdout": "", "stderr": ""}
 
+    def remove_stack(self, *, stack, namespace):
+        self.remove_payload = {"stack": stack, "namespace": namespace}
+        return self.remove_payload
+
 
 def test_when_create_stack_support_x_content():
     main(["deploy", "pytest_test_x_content", "./tests/docker-compose-example.yml"])
@@ -556,6 +560,158 @@ def test_deploy_enqueues_manager_callback_when_supported(monkeypatch, tmp_path):
     assert fake_manager.deploy_payloads[-1]["options"] == {}
 
 
+def test_manager_deploy_keeps_resources_portable_for_manager_materialization(monkeypatch, tmp_path):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "configs:\n"
+        "  app-config:\n"
+        "    name: shared-config\n"
+        "    x-content: new-content\n"
+        "secrets:\n"
+        "  app-token:\n"
+        "    x-generate: true\n"
+        "services:\n"
+        "  api:\n"
+        "    image: busybox\n"
+        "    configs: [app-config]\n"
+        "    secrets: [app-token]\n"
+    )
+
+    docker = Docker()
+    docker.stack.deploy("team-a", str(compose_file))
+    docker.stack.commands[-1].execute()
+
+    deployed = yaml.safe_load(fake_manager.deploy_payloads[-1]["compose"])
+    assert deployed["configs"]["app-config"] == {
+        "name": "shared-config",
+        "x-content": "new-content",
+    }
+    assert deployed["secrets"]["app-token"] == {"x-generate": True}
+    assert fake_manager.resolve_config_payloads == []
+    assert fake_manager.resolve_secret_payloads == []
+
+
+def test_manager_deploy_embeds_config_file_and_inlines_secret_file(monkeypatch, tmp_path):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    (tmp_path / "app.conf").write_text("setting=true\n")
+    (tmp_path / "token.txt").write_text("secret-value\n")
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(
+        "configs:\n"
+        "  app-config:\n"
+        "    file: app.conf\n"
+        "secrets:\n"
+        "  app-token:\n"
+        "    file: token.txt\n"
+        "services:\n"
+        "  api:\n"
+        "    image: busybox\n"
+        "    configs: [app-config]\n"
+        "    secrets: [app-token]\n"
+    )
+
+    docker = Docker()
+    docker.stack.deploy("team-a", str(compose_file))
+    docker.stack.commands[-1].execute()
+
+    embedded_files = decode_x_files(fake_manager.deploy_payloads[-1]["compose"])
+    assert embedded_files["app.conf"] == "setting=true\n"
+    assert "token.txt" not in embedded_files
+    deployed = yaml.safe_load(fake_manager.deploy_payloads[-1]["compose"])
+    assert deployed["secrets"]["app-token"] == {"x-content": "secret-value\n"}
+
+
+def test_manager_deploy_forwards_all_supported_options(monkeypatch, tmp_path):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  api:\n    image: busybox\n")
+
+    docker = Docker()
+    docker.stack.deploy(
+        "team-a",
+        str(compose_file),
+        with_registry_auth=True,
+        prune=True,
+        resolve_image="changed",
+        force_update=True,
+    )
+    docker.stack.commands[-1].execute()
+
+    assert fake_manager.deploy_payloads[-1]["options"] == {
+        "with_registry_auth": True,
+        "prune": True,
+        "resolve_image": "changed",
+        "force_update": True,
+    }
+
+
+def test_manager_deploy_rejects_unsupported_tag_instead_of_ignoring_it(monkeypatch, tmp_path):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text("services:\n  api:\n    image: busybox\n")
+
+    with pytest.raises(RuntimeError, match="does not expose deployment tags"):
+        Docker().stack.deploy("team-a", str(compose_file), tag="stable")
+
+    assert fake_manager.deploy_payloads == []
+
+
+def test_manager_deploy_prints_generated_secret_values(capsys):
+    class GeneratedSecretManager(FakeManagerClient):
+        def deploy_stack(self, *, stack, namespace, compose, options=None):
+            return {
+                "warnings": [],
+                "stdout": "",
+                "stderr": "",
+                "generated_secrets": [
+                    {"logical_name": "app-token", "actual_name": "team-a_app-token", "value": "generated-value"}
+                ],
+            }
+
+    Docker().stack._deploy_via_manager(
+        GeneratedSecretManager(),
+        stack_name="team-a",
+        namespace="default",
+        rendered_content="services: {}",
+        options={},
+    )
+
+    output = capsys.readouterr().out
+    assert "app-token: generated-value" in output
+
+
+def test_explicit_manager_query_error_does_not_fall_back_to_daemon(monkeypatch):
+    class FailingManager(FakeManagerClient):
+        def list_stacks(self):
+            raise RuntimeError("Manager request failed (GET /api/docker-stack/stacks): HTTP 503")
+
+    monkeypatch.setenv("DOCKER_MANAGER_URL", "https://manager.example.test:2378")
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: FailingManager())
+    monkeypatch.setattr(
+        "docker_stack.cli.run_cli_command",
+        lambda *_args, **_kwargs: pytest.fail("explicit manager errors must not fall back to daemon CLI"),
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        Docker().stack.ls()
+
+
+def test_manager_rm_uses_lifecycle_api(monkeypatch):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    docker = Docker()
+
+    docker.stack.rm("team-a", namespace="prod")
+    assert "docker-manager stack rm team-a" in str(docker.stack.commands[-1])
+    docker.stack.commands[-1].execute()
+    assert fake_manager.remove_payload == {"stack": "team-a", "namespace": "prod"}
+
+
 def test_manager_deploy_preserves_with_registry_auth_option(monkeypatch, tmp_path):
     fake_manager = FakeManagerClient()
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
@@ -877,7 +1033,7 @@ def test_login_inside_shell_reports_active_token(monkeypatch, tmp_path, capsys):
     assert f"DOCKER_CONFIG={tmp_path}" in output
 
 
-def test_shell_reuses_named_context_and_opens_isolated_bash(monkeypatch, capsys):
+def test_shell_authenticates_and_opens_managed_shell(monkeypatch, capsys):
     captured = {}
 
     def fake_resolve_shell_login_config(**kwargs):
@@ -887,20 +1043,26 @@ def test_shell_reuses_named_context_and_opens_isolated_bash(monkeypatch, capsys)
             context_name="office",
             docker_context_host="tcp://172.31.0.6:2378",
             skip_tls_verify=True,
+            timeout_secs=30,
         )
 
-    def fake_ensure_isolated_login(config):
-        assert config.context_name == "office"
-        return Path.home() / ".docker-stack" / "actions" / "office", None
+    login_result = SimpleNamespace(
+        access_token="access-token",
+        refresh_token="refresh-token",
+        redirect_uri="http://localhost:8079/auth/callback",
+        callback_port=8079,
+        expires_at=None,
+        refresh_expires_at=None,
+    )
 
-    def fake_open_context_shell(config_dir, context_name):
-        assert config_dir == Path.home() / ".docker-stack" / "actions" / "office"
-        assert context_name == "office"
+    def fake_run_managed_shell(config, result):
+        assert config.context_name == "office"
+        assert result is login_result
         return 0
 
     monkeypatch.setattr("docker_stack.cli.resolve_shell_login_config", fake_resolve_shell_login_config)
-    monkeypatch.setattr("docker_stack.cli.ensure_isolated_login", fake_ensure_isolated_login)
-    monkeypatch.setattr("docker_stack.cli.open_context_shell", fake_open_context_shell)
+    monkeypatch.setattr("docker_stack.cli.browser_login", lambda _config: login_result)
+    monkeypatch.setattr("docker_stack.cli.run_managed_shell", fake_run_managed_shell)
 
     with pytest.raises(SystemExit) as excinfo:
         main(["shell", "office"])
@@ -911,40 +1073,29 @@ def test_shell_reuses_named_context_and_opens_isolated_bash(monkeypatch, capsys)
     assert captured["context_name"] is None
     output = capsys.readouterr().out
     assert "Opening shell context=office" in output
-    assert "Access token already active." in output
+    assert "Shell manager=https://172.31.0.6:2378" in output
 
 
-def test_shell_inside_same_context_reports_refreshing_current_shell(monkeypatch, tmp_path, capsys):
+def test_shell_inside_same_context_reports_already_active(monkeypatch, capsys):
     def fake_resolve_shell_login_config(**_kwargs):
         return SimpleNamespace(
             manager_url="https://172.31.0.6:2378",
             context_name="office",
             docker_context_host="tcp://172.31.0.6:2378",
             skip_tls_verify=True,
+            timeout_secs=30,
         )
 
-    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
-    monkeypatch.setenv("DOCKER_CONTEXT", "office")
+    monkeypatch.setenv("DOCKER_STACK_SHELL_SOCKET", "/tmp/docker-stack-test.sock")
+    monkeypatch.setenv("DOCKER_STACK_SHELL_SECRET", "secret")
+    monkeypatch.setenv("DOCKER_STACK_SHELL_CONTEXT", "office")
     monkeypatch.setattr("docker_stack.cli.resolve_shell_login_config", fake_resolve_shell_login_config)
-    monkeypatch.setattr(
-        "docker_stack.cli.ensure_isolated_login",
-        lambda _config: (
-            tmp_path,
-            SimpleNamespace(
-                redirect_uri="http://localhost:8079/auth/callback",
-                expires_at=None,
-            ),
-        ),
-    )
-    monkeypatch.setattr("docker_stack.cli.open_context_shell", lambda _config_dir, _context_name: 0)
+    monkeypatch.setattr("docker_stack.cli.browser_login", lambda _config: pytest.fail("must not log in"))
 
-    with pytest.raises(SystemExit) as excinfo:
-        main(["shell", "office"])
+    main(["shell", "office"])
 
-    assert excinfo.value.code == 0
     output = capsys.readouterr().out
-    assert "Refreshing current shell context=office" in output
-    assert f"DOCKER_CONFIG={tmp_path}" in output
+    assert "docker-stack shell context=office is already active" in output
 
 
 def test_open_context_shell_clears_endpoint_overrides(monkeypatch, tmp_path):

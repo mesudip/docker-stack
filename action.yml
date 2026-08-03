@@ -1,5 +1,5 @@
 name: Setup docker-stack auth
-description: Configure isolated Docker auth/context for docker-stack and Docker CLI commands in GitHub Actions.
+description: Configure Docker-Manager auth and optionally deploy a stack with service image overrides.
 
 inputs:
   manager:
@@ -29,6 +29,38 @@ inputs:
     description: Verify the manager TLS certificate. Defaults to false.
     required: false
     default: "false"
+  stack:
+    description: Optional stack name to deploy. When omitted, the action only configures auth.
+    required: false
+    default: ""
+  compose-file:
+    description: Compose file to deploy when stack is set and images is empty.
+    required: false
+    default: docker-compose.yml
+  namespace:
+    description: Stack namespace to deploy.
+    required: false
+    default: default
+  with-registry-auth:
+    description: Pass registry auth through the manager deploy path.
+    required: false
+    default: "false"
+  prune:
+    description: Remove services no longer referenced by the compose file. Not supported for image-only deploys.
+    required: false
+    default: "false"
+  resolve-image:
+    description: Optional image resolution policy. One of always, changed, or never.
+    required: false
+    default: ""
+  force-update:
+    description: Force service task updates through Docker-Manager.
+    required: false
+    default: "false"
+  images:
+    description: Optional newline-separated SERVICE=IMAGE overrides deployed through Docker-Manager without requiring a compose file.
+    required: false
+    default: ""
 
 outputs:
   docker-config:
@@ -67,3 +99,112 @@ runs:
         oidc-audience: ${{ inputs.oidc-audience }}
         docker-config-dir: ${{ inputs.docker-config-dir }}
         verify-ssl: ${{ inputs.verify-ssl }}
+
+    - name: Deploy stack
+      if: ${{ inputs.stack != '' }}
+      shell: bash
+      env:
+        DOCKER_STACK_ACTION_STACK: ${{ inputs.stack }}
+        DOCKER_STACK_ACTION_COMPOSE_FILE: ${{ inputs.compose-file }}
+        DOCKER_STACK_ACTION_NAMESPACE: ${{ inputs.namespace }}
+        DOCKER_STACK_ACTION_WITH_REGISTRY_AUTH: ${{ inputs.with-registry-auth }}
+        DOCKER_STACK_ACTION_PRUNE: ${{ inputs.prune }}
+        DOCKER_STACK_ACTION_RESOLVE_IMAGE: ${{ inputs.resolve-image }}
+        DOCKER_STACK_ACTION_FORCE_UPDATE: ${{ inputs.force-update }}
+        DOCKER_STACK_ACTION_IMAGES: ${{ inputs.images }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$(printf '%s' "$DOCKER_STACK_ACTION_IMAGES" | tr -d '[:space:]')" ]; then
+          python3 - <<'PY'
+        import os
+        import sys
+        from docker_stack.manager_api import discover_manager_client
+
+        def print_manager_event(event):
+            event_name = event.get("event")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                data = {}
+            if event_name == "stdout":
+                line = str(data.get("line") or "").rstrip()
+                if line:
+                    print(line, flush=True)
+            elif event_name == "stderr":
+                line = str(data.get("line") or "").rstrip()
+                if line:
+                    print(line, file=sys.stderr, flush=True)
+            elif event_name == "command":
+                program = data.get("program") or "manager"
+                stack = data.get("stack")
+                suffix = f" {stack}" if stack else ""
+                print(f"[manager] {program}{suffix}", flush=True)
+            elif event_name == "resource":
+                kind = data.get("kind")
+                logical_name = data.get("logical_name")
+                actual_name = data.get("actual_name")
+                if kind and logical_name and actual_name:
+                    print(f"[manager] {kind} {logical_name} -> {actual_name}", flush=True)
+            elif event_name == "service_progress":
+                service = data.get("service") or "service"
+                status = data.get("status") or "progress"
+                message = data.get("message") or data.get("error") or ""
+                if message:
+                    print(f"[manager] {service}: {status}: {message}", flush=True)
+
+        overrides = {}
+        for raw in os.environ.get("DOCKER_STACK_ACTION_IMAGES", "").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            service, sep, image = raw.partition("=")
+            service = service.strip()
+            image = image.strip()
+            if sep != "=" or not service or not image:
+                raise SystemExit(f"invalid image override {raw!r}; expected SERVICE=IMAGE")
+            overrides[service] = image
+
+        client = discover_manager_client()
+        if client is None:
+            raise SystemExit("Docker-Manager client is not available")
+
+        options = {}
+        if os.environ.get("DOCKER_STACK_ACTION_WITH_REGISTRY_AUTH", "").lower() == "true":
+            options["with_registry_auth"] = True
+        if os.environ.get("DOCKER_STACK_ACTION_PRUNE", "").lower() == "true":
+            raise SystemExit("prune is not supported by Docker-Manager image-only deploys; use a compose deploy")
+        resolve_image = os.environ.get("DOCKER_STACK_ACTION_RESOLVE_IMAGE", "").strip()
+        if resolve_image:
+            if resolve_image not in {"always", "changed", "never"}:
+                raise SystemExit("invalid resolve-image; expected always, changed, or never")
+            options["resolve_image"] = resolve_image
+        if os.environ.get("DOCKER_STACK_ACTION_FORCE_UPDATE", "").lower() == "true":
+            options["force_update"] = True
+        payload = client.deploy_stack_images(
+            stack=os.environ["DOCKER_STACK_ACTION_STACK"],
+            namespace=os.environ["DOCKER_STACK_ACTION_NAMESPACE"],
+            images=overrides,
+            options=options,
+            on_event=print_manager_event,
+        )
+        for warning in payload.get("warnings") or []:
+            print(f"[manager] {warning}")
+        PY
+          exit 0
+        fi
+
+        args=(deploy --namespace "$DOCKER_STACK_ACTION_NAMESPACE")
+        if [ "$DOCKER_STACK_ACTION_WITH_REGISTRY_AUTH" = "true" ]; then
+          args+=(--with-registry-auth)
+        fi
+        if [ "$DOCKER_STACK_ACTION_PRUNE" = "true" ]; then
+          args+=(--prune)
+        fi
+        if [ -n "$DOCKER_STACK_ACTION_RESOLVE_IMAGE" ]; then
+          args+=(--resolve-image "$DOCKER_STACK_ACTION_RESOLVE_IMAGE")
+        fi
+        if [ "$DOCKER_STACK_ACTION_FORCE_UPDATE" = "true" ]; then
+          args+=(--force-update)
+        fi
+        args+=("$DOCKER_STACK_ACTION_STACK" "$DOCKER_STACK_ACTION_COMPOSE_FILE")
+        docker-stack "${args[@]}"
