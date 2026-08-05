@@ -58,7 +58,10 @@ Use this option when CI can connect directly to the target Docker daemon.
 
 #### 2. Docker-Manager
 
-Use the bundled action when deploying through Docker-Manager:
+Use the bundled action when deploying through
+[Docker-Manager](https://github.com/mesudip/docker-enterprise). The manager
+repository contains the server source, installation instructions, and deployment
+documentation.
 
 For a full compose deployment directly from CI, use the action to configure
 Docker-Manager authentication and then run the normal `docker-stack deploy`
