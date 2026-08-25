@@ -137,33 +137,155 @@ def _select_node(value: str) -> str:
     return hostname
 
 
-def _human_age(timestamp: object) -> str:
+COMMAND_DISPLAY_WIDTH = 20
+SIZE_UNITS = ("B", "kB", "MB", "GB", "TB", "PB")
+
+
+def _human_duration(timestamp: object) -> str:
+    """Mirror docker's units.HumanDuration for the CREATED column."""
     try:
-        seconds = max(0, int(time.time()) - int(timestamp))
+        seconds = time.time() - float(timestamp)
     except (TypeError, ValueError):
-        return "-"
+        return ""
+    if seconds < 1:
+        return "Less than a second ago"
+    if int(seconds) == 1:
+        return "1 second ago"
     if seconds < 60:
-        return f"{seconds} seconds ago"
-    if seconds < 3600:
-        return f"{seconds // 60} minutes ago"
-    if seconds < 86400:
-        return f"{seconds // 3600} hours ago"
-    return f"{seconds // 86400} days ago"
+        return f"{int(seconds)} seconds ago"
+    minutes = int(seconds // 60)
+    if minutes == 1:
+        return "About a minute ago"
+    if minutes < 60:
+        return f"{minutes} minutes ago"
+    hours = int(seconds / 3600 + 0.5)
+    if hours == 1:
+        return "About an hour ago"
+    if hours < 48:
+        return f"{hours} hours ago"
+    if hours < 24 * 7 * 2:
+        return f"{hours // 24} days ago"
+    if hours < 24 * 30 * 2:
+        return f"{hours // 24 // 7} weeks ago"
+    if hours < 24 * 365 * 2:
+        return f"{hours // 24 // 30} months ago"
+    return f"{hours // 24 // 365} years ago"
+
+
+def _human_size(value: object) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return ""
+    index = 0
+    while size >= 1000.0 and index < len(SIZE_UNITS) - 1:
+        size /= 1000.0
+        index += 1
+    return f"{size:.3g}{SIZE_UNITS[index]}"
+
+
+def _quote_command(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _ellipsis(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    return value[: width - 1] + "…"
+
+
+def _form_port_group(key: str, first: int, last: int) -> str:
+    parts = key.split("/")
+    address = ""
+    protocol = parts[0]
+    if len(parts) > 1:
+        address = parts[0]
+        protocol = parts[1]
+    group = str(first) if first == last else f"{first}-{last}"
+    if address:
+        group = f"{address}:{group}->{group}"
+    return f"{group}/{protocol}"
 
 
 def _format_ports(ports: object) -> str:
+    """Mirror docker's api/types.DisplayablePorts for the PORTS column."""
     if not isinstance(ports, list):
         return ""
-    values = []
+    entries = []
     for port in ports:
         if not isinstance(port, dict):
             continue
-        private = port.get("PrivatePort")
-        protocol = port.get("Type") or "tcp"
-        public = port.get("PublicPort")
-        address = port.get("IP") or "0.0.0.0"
-        values.append(f"{address}:{public}->{private}/{protocol}" if public is not None else f"{private}/{protocol}")
-    return ", ".join(values)
+        try:
+            private = int(port.get("PrivatePort"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            public = int(port.get("PublicPort"))
+        except (TypeError, ValueError):
+            public = None
+        entries.append((private, str(port.get("Type") or "tcp"), str(port.get("IP") or ""), public))
+    entries.sort(key=lambda entry: entry[0])
+    groups: Dict[str, List[int]] = {}
+    group_keys: List[str] = []
+    result: List[str] = []
+    host_mappings: List[str] = []
+    for private, protocol, address, public in entries:
+        key = protocol
+        if address and public:
+            if public != private:
+                host_mappings.append(f"{address}:{public}->{private}/{protocol}")
+                continue
+            key = f"{address}/{protocol}"
+        group = groups.get(key)
+        if group is None:
+            groups[key] = [private, private]
+            group_keys.append(key)
+            continue
+        if private == group[1] + 1:
+            group[1] = private
+            continue
+        result.append(_form_port_group(key, group[0], group[1]))
+        groups[key] = [private, private]
+    for key in group_keys:
+        first, last = groups[key]
+        result.append(_form_port_group(key, first, last))
+    result.extend(host_mappings)
+    return ", ".join(result)
+
+
+def _format_names(names: object, *, no_trunc: bool) -> str:
+    values = [str(name).lstrip("/") for name in names] if isinstance(names, list) else []
+    if not no_trunc:
+        for name in values:
+            if "/" not in name:
+                values = [name]
+                break
+    return ",".join(values)
+
+
+def _format_image(image: object, image_id: object, *, no_trunc: bool) -> str:
+    value = str(image or "")
+    if not value:
+        return "<no image>"
+    if no_trunc:
+        return value
+    identifier = str(image_id or "")
+    if identifier and _short_id(identifier) == _short_id(value):
+        return _short_id(value)
+    return value
+
+
+def _short_id(value: str) -> str:
+    return value[len("sha256:") :][:12] if value.startswith("sha256:") else value[:12]
+
+
+def _print_table(columns: List[str], rows: List[Dict[str, str]]) -> None:
+    widths = {column: max(len(column), max((len(row[column]) for row in rows), default=0)) for column in columns}
+    for values in [{column: column for column in columns}, *rows]:
+        print("   ".join(values[column].ljust(widths[column]) for column in columns).rstrip())
 
 
 def _print_cluster_containers(payload: Dict[str, object], *, no_trunc: bool = False, show_size: bool = False) -> int:
@@ -172,29 +294,31 @@ def _print_cluster_containers(payload: Dict[str, object], *, no_trunc: bool = Fa
         if not isinstance(entry, dict) or not isinstance(entry.get("docker"), dict):
             continue
         item = entry["docker"]
-        container_id = str(item.get("Id") or "-")
-        names = item.get("Names") if isinstance(item.get("Names"), list) else []
+        container_id = str(item.get("Id") or "")
+        command = str(item.get("Command") or "")
         row = {
             "CONTAINER ID": container_id if no_trunc else container_id[:12],
-            "IMAGE": str(item.get("Image") or "-"),
-            "COMMAND": str(item.get("Command") or "-"),
-            "CREATED": _human_age(item.get("Created")),
-            "STATUS": str(item.get("Status") or item.get("State") or "-"),
+            "IMAGE": _format_image(item.get("Image"), item.get("ImageID"), no_trunc=no_trunc),
+            "COMMAND": _quote_command(command if no_trunc else _ellipsis(command, COMMAND_DISPLAY_WIDTH)),
+            "CREATED": _human_duration(item.get("Created")),
+            "STATUS": str(item.get("Status") or item.get("State") or ""),
             "PORTS": _format_ports(item.get("Ports")),
-            "NAMES": ",".join(str(name).lstrip("/") for name in names) or "-",
-            "NODE": str(entry.get("node_name") or entry.get("node_id") or "-"),
+            "NAMES": _format_names(item.get("Names"), no_trunc=no_trunc),
+            "NODE": str(entry.get("node_name") or entry.get("node_id") or ""),
         }
         if show_size:
-            row["SIZE"] = str(item.get("SizeRw") if item.get("SizeRw") is not None else "-")
+            size = _human_size(item.get("SizeRw") or 0)
+            try:
+                virtual = float(item.get("SizeRootFs") or 0)
+            except (TypeError, ValueError):
+                virtual = 0
+            row["SIZE"] = f"{size} (virtual {_human_size(virtual)})" if virtual > 0 else size
         rows.append(row)
     columns = ["CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"]
     if show_size:
         columns.append("SIZE")
     columns.append("NODE")
-    widths = {column: max(len(column), max((len(row[column]) for row in rows), default=0)) for column in columns}
-    print("   ".join(column.ljust(widths[column]) for column in columns))
-    for row in rows:
-        print("   ".join(row[column].ljust(widths[column]) for column in columns))
+    _print_table(columns, rows)
     errors = payload.get("node_errors") if isinstance(payload.get("node_errors"), list) else []
     for error in errors:
         if isinstance(error, dict):

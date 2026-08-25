@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,6 +87,48 @@ def test_managed_docker_ps_renders_node_column(monkeypatch, capsys):
     assert "NODE" in output
     assert "worker-02" in output
     assert "abcdef123456" in output
+
+
+def test_managed_docker_ps_matches_docker_columns(monkeypatch, capsys):
+    client = SimpleNamespace(
+        supports=lambda feature: feature == "cluster_container_cli_v1",
+        list_containers=lambda **_kwargs: {
+            "containers": [
+                {
+                    "node_id": "node-1",
+                    "node_name": "worker-02",
+                    "docker": {
+                        "Id": "467fce208a05dddd",
+                        "Image": "registry.example.com/app/backend:v1",
+                        "Command": "sh -c 'java $JAVA_OPTS -jar /app/app.jar'",
+                        "Created": int(time.time()) - 17 * 60,
+                        "Status": "Up 17 minutes",
+                        "Ports": [
+                            {"PrivatePort": 8080, "Type": "tcp"},
+                            {"PrivatePort": 8081, "Type": "tcp"},
+                            {"IP": "0.0.0.0", "PrivatePort": 443, "PublicPort": 8443, "Type": "tcp"},
+                        ],
+                        "Names": ["/app_backend.1.qtfngt97xvabnhj0ehk4us6kk"],
+                    },
+                }
+            ],
+            "node_errors": [],
+        },
+    )
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
+
+    assert _managed_docker(["ps"]) == 0
+    header, row = capsys.readouterr().out.splitlines()
+
+    assert header.split() == [
+        "CONTAINER", "ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES", "NODE",
+    ]
+    assert row.startswith("467fce208a05   ")
+    assert '"sh -c \'java $JAVA_O\u2026"' in row
+    assert "17 minutes ago" in row
+    assert "8080-8081/tcp, 0.0.0.0:8443->443/tcp" in row
+    assert row.endswith("worker-02")
+    assert row == row.rstrip()
 
 
 def test_managed_docker_ps_forwards_global_latest_and_limit(monkeypatch):
