@@ -131,6 +131,57 @@ def test_managed_docker_ps_matches_docker_columns(monkeypatch, capsys):
     assert row == row.rstrip()
 
 
+@pytest.mark.parametrize(
+    "image,expected,expected_no_trunc",
+    [
+        (
+            "registry.example.com/app/design-system:af037b33@sha256:15d623cfa2f856c8101f9f3c47003d412f9b2bf72c69c95d5dff07a74e5f7b60",
+            "registry.example.com/app/design-system:af037b33",
+            "registry.example.com/app/design-system:af037b33@sha256:15d623cfa2f856c8101f9f3c47003d412f9b2bf72c69c95d5dff07a74e5f7b60",
+        ),
+        (
+            "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+            "alpine",
+            "docker.io/library/alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b",
+        ),
+        ("nginx:1.27", "nginx:1.27", "nginx:1.27"),
+        (
+            "sha256:0e901e68141fd02f237cf63eb842529f8a9500636a9419e3cf4fb986b8fe3d5d",
+            "0e901e68141f",
+            "sha256:0e901e68141fd02f237cf63eb842529f8a9500636a9419e3cf4fb986b8fe3d5d",
+        ),
+    ],
+)
+def test_managed_docker_ps_drops_pinned_digest_like_docker(monkeypatch, capsys, image, expected, expected_no_trunc):
+    client = SimpleNamespace(
+        supports=lambda feature: feature == "cluster_container_cli_v1",
+        list_containers=lambda **_kwargs: {
+            "containers": [
+                {
+                    "node_name": "worker-02",
+                    "docker": {
+                        "Id": "abcdef1234567890",
+                        "Image": image,
+                        "Command": "sleep",
+                        "Created": int(time.time()) - 60,
+                        "Status": "Up 1 minute",
+                        "Ports": [],
+                        "Names": ["/svc.1.abc"],
+                    },
+                }
+            ],
+            "node_errors": [],
+        },
+    )
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
+
+    assert _managed_docker(["ps"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split()[1] == expected
+
+    assert _managed_docker(["ps", "--no-trunc"]) == 0
+    assert capsys.readouterr().out.splitlines()[1].split()[1] == expected_no_trunc
+
+
 def test_managed_docker_ps_forwards_global_latest_and_limit(monkeypatch):
     calls = []
     client = SimpleNamespace(

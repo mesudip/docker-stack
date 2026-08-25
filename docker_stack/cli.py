@@ -266,15 +266,35 @@ def _format_names(names: object, *, no_trunc: bool) -> str:
     return ",".join(values)
 
 
+DOCKER_HUB_NAME_PREFIXES = (
+    "docker.io/library/",
+    "index.docker.io/library/",
+    "docker.io/",
+    "index.docker.io/",
+)
+
+
+def _familiar_image_name(value: str) -> str:
+    for prefix in DOCKER_HUB_NAME_PREFIXES:
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+    return value
+
+
 def _format_image(image: object, image_id: object, *, no_trunc: bool) -> str:
     value = str(image or "")
     if not value:
         return "<no image>"
     if no_trunc:
         return value
+    if value.startswith("sha256:"):
+        return _short_id(value)
     identifier = str(image_id or "")
     if identifier and _short_id(identifier) == _short_id(value):
         return _short_id(value)
+    if "@" in value:
+        # docker ps keeps `name[:tag]` and drops the pinned digest unless --no-trunc.
+        return _familiar_image_name(value.split("@", 1)[0])
     return value
 
 
