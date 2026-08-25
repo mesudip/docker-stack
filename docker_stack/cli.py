@@ -1752,6 +1752,7 @@ def open_context_shell(config_dir: Path, context_name: str) -> int:
         env.pop(key, None)
     env["DOCKER_CONFIG"] = str(config_dir)
     env["DOCKER_CONTEXT"] = context_name
+    env["DOCKER_MANAGER_CONTEXT_NAME"] = context_name
     shell = env.get("SHELL", "").strip() or "/bin/bash"
     return subprocess.run([shell, "-i"], check=False, env=env).returncode
 

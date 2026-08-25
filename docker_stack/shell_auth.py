@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from docker_stack.login import (
+    DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV,
     DockerManagerLoginConfig,
     DockerManagerLoginResult,
     browser_login,
@@ -733,6 +734,10 @@ def run_managed_shell(config: DockerManagerLoginConfig, result: DockerManagerLog
         env["DOCKER_CONTEXT"] = config.context_name
         env["DOCKER_MANAGER_URL"] = config.manager_url
         env["DOCKER_MANAGER_CONTEXT_NAME"] = config.context_name
+        # The endpoint's TLS mode is already known, so in-shell commands never
+        # need to re-probe it (a verified probe against a private CA only
+        # produces aborted TLS connections on the manager).
+        env[DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV] = "1" if config.skip_tls_verify else "0"
         env[SHELL_ORIGINAL_ZDOTDIR_ENV] = str(
             Path(os.getenv(SHELL_ORIGINAL_ZDOTDIR_ENV) or os.getenv("ZDOTDIR", str(Path.home())))
         )

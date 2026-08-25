@@ -9,12 +9,15 @@ import urllib.request
 import pytest
 
 from docker_stack.login import (
+    DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV,
     clear_docker_config_authorization_header,
     DockerManagerLoginConfig,
     build_auth_url,
     browser_login,
     configure_docker_context,
     detect_manager_url,
+    docker_config_http_headers,
+    probe_manager_url,
     ensure_isolated_login,
     format_expiry,
     isolated_docker_config_dir,
@@ -254,7 +257,7 @@ def test_configure_docker_context_uses_skip_tls_verify_for_detected_tls(monkeypa
 
 
 def test_detect_manager_url_prefers_https_when_available(monkeypatch):
-    def fake_probe(url, *, timeout=3, verify_tls=True):
+    def fake_probe(url, *, timeout=3, verify_tls=True, headers=None):
         if url == "https://172.31.0.6:2376":
             return True, False
         return False, False
@@ -268,7 +271,7 @@ def test_detect_manager_url_prefers_https_when_available(monkeypatch):
 
 
 def test_detect_manager_url_marks_skip_verify_for_self_signed_tls(monkeypatch):
-    def fake_probe(url, *, timeout=3, verify_tls=True):
+    def fake_probe(url, *, timeout=3, verify_tls=True, headers=None):
         if url == "https://172.31.0.6:2376" and verify_tls:
             return False, True
         if url == "https://172.31.0.6:2376" and not verify_tls:
@@ -284,7 +287,7 @@ def test_detect_manager_url_marks_skip_verify_for_self_signed_tls(monkeypatch):
 
 
 def test_detect_manager_url_uses_http_default_port_when_https_unavailable(monkeypatch):
-    def fake_probe(url, *, timeout=3, verify_tls=True):
+    def fake_probe(url, *, timeout=3, verify_tls=True, headers=None):
         if url == "http://172.31.0.6:2375":
             return True, False
         return False, False
@@ -295,6 +298,144 @@ def test_detect_manager_url_uses_http_default_port_when_https_unavailable(monkey
 
     assert url == "http://172.31.0.6:2375"
     assert skip_tls_verify is False
+
+
+def test_detect_manager_url_skips_verified_probe_when_tls_mode_is_known(monkeypatch):
+    attempts = []
+
+    def fake_probe(url, *, timeout=3, verify_tls=True, headers=None):
+        attempts.append((url, verify_tls))
+        return (not verify_tls), False
+
+    monkeypatch.setattr("docker_stack.login.probe_manager_url", fake_probe)
+
+    url, skip_tls_verify = detect_manager_url("https://localhost:2376", skip_tls_verify=True)
+
+    assert url == "https://localhost:2376"
+    assert skip_tls_verify is True
+    # A verified handshake against a private CA is what produced UnknownCA alerts.
+    assert attempts == [("https://localhost:2376", False)]
+
+
+def test_detect_manager_url_ignores_skip_hint_when_verification_is_required(monkeypatch):
+    attempts = []
+
+    def fake_probe(url, *, timeout=3, verify_tls=True, headers=None):
+        attempts.append((url, verify_tls))
+        return verify_tls, False
+
+    monkeypatch.setattr("docker_stack.login.probe_manager_url", fake_probe)
+
+    url, skip_tls_verify = detect_manager_url(
+        "https://localhost:2376",
+        verify_ssl=True,
+        skip_tls_verify=True,
+    )
+
+    assert url == "https://localhost:2376"
+    assert skip_tls_verify is False
+    assert attempts == [("https://localhost:2376", True)]
+
+
+def test_probe_manager_url_sends_docker_config_headers(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=None):
+            return b""
+
+    def fake_urlopen(request, timeout=None, context=None):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        return FakeResponse()
+
+    monkeypatch.setattr("docker_stack.login.urllib.request.urlopen", fake_urlopen)
+
+    assert probe_manager_url(
+        "https://localhost:2376",
+        headers={"Authorization": "Bearer token-value"},
+    ) == (True, False)
+    assert captured["url"] == "https://localhost:2376/_ping"
+    assert captured["headers"]["Authorization"] == "Bearer token-value"
+
+
+def test_probe_manager_url_withholds_token_over_remote_cleartext(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=None):
+            return b""
+
+    def fake_urlopen(request, timeout=None, context=None):
+        captured["headers"] = dict(request.header_items())
+        return FakeResponse()
+
+    monkeypatch.setattr("docker_stack.login.urllib.request.urlopen", fake_urlopen)
+
+    probe_manager_url("http://manager.example.com:2375", headers={"Authorization": "Bearer token-value"})
+
+    assert "Authorization" not in captured["headers"]
+
+    probe_manager_url("http://localhost:2375", headers={"Authorization": "Bearer token-value"})
+
+    assert captured["headers"]["Authorization"] == "Bearer token-value"
+
+
+def test_docker_config_http_headers_reads_active_config(monkeypatch, tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"HttpHeaders": {"Authorization": "Bearer token-value", "X-Empty": " "}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+
+    assert docker_config_http_headers() == {"Authorization": "Bearer token-value"}
+
+
+def test_resolve_login_config_skips_probing_when_shell_exports_tls_mode(monkeypatch):
+    def fail_probe(*_args, **_kwargs):
+        raise AssertionError("the manager must not be probed when its TLS mode is known")
+
+    monkeypatch.setattr("docker_stack.login.probe_manager_url", fail_probe)
+    monkeypatch.setenv("DOCKER_MANAGER_URL", "https://localhost:2376")
+    monkeypatch.setenv(DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV, "1")
+
+    config = resolve_login_config(manager_target="https://localhost:2376")
+
+    assert config.manager_url == "https://localhost:2376"
+    assert config.skip_tls_verify is True
+
+
+def test_resolve_login_config_reuses_context_tls_mode(monkeypatch):
+    def fail_probe(*_args, **_kwargs):
+        raise AssertionError("the manager must not be probed when its TLS mode is known")
+
+    monkeypatch.setattr("docker_stack.login.probe_manager_url", fail_probe)
+    monkeypatch.setattr(
+        "docker_stack.login._inspect_docker_context",
+        lambda name, docker_config_dir=None: {
+            "Name": name,
+            "Endpoints": {"docker": {"Host": "tcp://localhost:2376", "SkipTLSVerify": True}},
+        },
+    )
+    monkeypatch.delenv(DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV, raising=False)
+    monkeypatch.setenv("DOCKER_CONTEXT", "local")
+
+    config = resolve_login_config(manager_target="tcp://localhost:2376")
+
+    assert config.manager_url == "https://localhost:2376"
+    assert config.skip_tls_verify is True
 
 
 def test_detect_manager_url_verify_ssl_requires_https(monkeypatch):
@@ -361,7 +502,7 @@ def test_resolve_login_config_ignores_malformed_context_host(monkeypatch):
 
 
 def test_resolve_login_config_detects_tls_for_positional_target(monkeypatch):
-    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False: ("https://172.31.0.6:2378", True))
+    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True))
 
     config = resolve_login_config(manager_target="172.31.0.6:2378", context_name="office")
 
@@ -375,7 +516,7 @@ def test_resolve_login_config_prefers_named_context_for_portless_target(monkeypa
         "docker_stack.login.docker_context_target",
         lambda context_name, docker_config_dir=None: "tcp://172.31.0.6:2378" if context_name == "office" else None,
     )
-    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False: ("https://172.31.0.6:2378", True))
+    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True))
 
     config = resolve_login_config(manager_target="office")
 
@@ -394,7 +535,7 @@ def test_resolve_login_config_prefers_isolated_named_context(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(
         "docker_stack.login.detect_manager_url",
-        lambda value, verify_ssl=False: ("https://172.31.3.3:2376", False),
+        lambda value, verify_ssl=False, **_kwargs: ("https://172.31.3.3:2376", False),
     )
 
     config = resolve_login_config(manager_target="saas-a")
@@ -409,7 +550,7 @@ def test_resolve_login_config_uses_current_context_target(monkeypatch):
         "docker_stack.login.current_docker_context_target",
         lambda: ("office", "tcp://172.31.0.6:2378"),
     )
-    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False: ("https://172.31.0.6:2378", True))
+    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True))
 
     config = resolve_login_config()
 
@@ -434,7 +575,7 @@ def test_resolve_shell_login_config_uses_persisted_context(monkeypatch):
             "tcp://172.31.0.6:2378" if docker_config_dir == isolated_docker_config_dir("office") else None
         ),
     )
-    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value: ("https://172.31.0.6:2378", True))
+    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, **_kwargs: ("https://172.31.0.6:2378", True))
 
     config = resolve_shell_login_config(shell_name="office", manager_target=None, context_name=None)
 

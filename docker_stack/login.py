@@ -14,7 +14,7 @@ import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 from docker_stack.command_runner import run_command
 
@@ -111,8 +111,132 @@ def _candidate_urls(target: str, *, verify_ssl: bool) -> list[str]:
     return [https_candidate, f"http://{normalized_target}:2375"]
 
 
-def probe_manager_url(url: str, *, timeout: int = 3, verify_tls: bool = True) -> tuple[bool, bool]:
-    request = urllib.request.Request(f"{url.rstrip('/')}/_ping", method="GET")
+DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV = "DOCKER_MANAGER_SKIP_TLS_VERIFY"
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_FALSY_VALUES = {"0", "false", "no", "off"}
+_CONTEXT_INSPECT_CACHE: Dict[Tuple[str, str], Optional[Dict[str, object]]] = {}
+
+
+def _parse_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in _TRUTHY_VALUES:
+        return True
+    if normalized in _FALSY_VALUES:
+        return False
+    return None
+
+
+def _host_and_port(value: str) -> Optional[Tuple[str, Optional[int]]]:
+    target = normalize_manager_target(value)
+    parsed = urllib.parse.urlparse(target if "://" in target else f"//{target}")
+    if not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return parsed.hostname.lower(), port
+
+
+def docker_config_path(docker_config_dir: Optional[Path] = None) -> Path:
+    if docker_config_dir is None:
+        configured = os.getenv("DOCKER_CONFIG", "").strip()
+        docker_config_dir = Path(configured) if configured else Path.home() / ".docker"
+    return Path(docker_config_dir) / "config.json"
+
+
+def docker_config_http_headers(docker_config_dir: Optional[Path] = None) -> Dict[str, str]:
+    """Headers the Docker CLI sends to the manager, including the access token."""
+    try:
+        payload = read_docker_config(docker_config_path(docker_config_dir))
+    except RuntimeError:
+        return {}
+    headers = payload.get("HttpHeaders")
+    if not isinstance(headers, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in headers.items()
+        if isinstance(key, str) and isinstance(value, str) and key.strip() and value.strip()
+    }
+
+
+def _probe_headers(url: str, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    if not headers:
+        return {}
+    if url.startswith("https://"):
+        return dict(headers)
+    host = (_host_and_port(url) or ("", None))[0]
+    if host in LOOPBACK_HOSTS:
+        return dict(headers)
+    # Never put the access token on the wire in cleartext towards a remote host.
+    return {key: value for key, value in headers.items() if key.lower() != "authorization"}
+
+
+def _docker_context_skip_tls_verify(context_payload: Optional[Dict[str, object]]) -> Optional[bool]:
+    if not isinstance(context_payload, dict):
+        return None
+    endpoints = context_payload.get("Endpoints") or context_payload.get("endpoints") or {}
+    docker_endpoint = {}
+    if isinstance(endpoints, dict):
+        docker_endpoint = endpoints.get("docker") or endpoints.get("Docker") or {}
+    if not isinstance(docker_endpoint, dict):
+        return None
+    value = docker_endpoint.get("SkipTLSVerify")
+    if value is None:
+        value = docker_endpoint.get("skipTLSVerify")
+    return bool(value) if isinstance(value, bool) else None
+
+
+def _skip_tls_verify_hint(
+    target: str,
+    *,
+    context_name: Optional[str] = None,
+    docker_config_dir: Optional[Path] = None,
+) -> Optional[bool]:
+    """The TLS mode of an endpoint we already configured, so probing it again is unnecessary."""
+    env_hint = _parse_bool(os.getenv(DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV))
+    if env_hint is not None:
+        return env_hint
+    target_origin = _host_and_port(target)
+    if target_origin is None or target_origin[1] is None:
+        return None
+    candidate_names = [
+        context_name,
+        os.getenv("DOCKER_MANAGER_CONTEXT_NAME"),
+        os.getenv("DOCKER_CONTEXT"),
+    ]
+    seen = set()
+    for name in candidate_names:
+        name = (name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        payload = _inspect_docker_context(name, docker_config_dir)
+        host = _docker_context_host(payload)
+        if not host or _host_and_port(host) != target_origin:
+            continue
+        hint = _docker_context_skip_tls_verify(payload)
+        if hint is not None:
+            return hint
+    return None
+
+
+def probe_manager_url(
+    url: str,
+    *,
+    timeout: int = 3,
+    verify_tls: bool = True,
+    headers: Optional[Dict[str, str]] = None,
+) -> tuple[bool, bool]:
+    request = urllib.request.Request(
+        f"{url.rstrip('/')}/_ping",
+        method="GET",
+        headers=_probe_headers(url, headers),
+    )
     context = None
     if url.startswith("https://") and not verify_tls:
         context = ssl._create_unverified_context()
@@ -132,20 +256,34 @@ def probe_manager_url(url: str, *, timeout: int = 3, verify_tls: bool = True) ->
         return False, True
 
 
-def detect_manager_url(target: str, *, verify_ssl: bool = False) -> tuple[str, bool]:
+def detect_manager_url(
+    target: str,
+    *,
+    verify_ssl: bool = False,
+    skip_tls_verify: Optional[bool] = None,
+    headers: Optional[Dict[str, str]] = None,
+) -> tuple[str, bool]:
     normalized_target = normalize_manager_target(target)
     parsed = urllib.parse.urlparse(normalized_target)
     explicit_scheme = parsed.scheme in {"http", "https"}
 
     candidates = _candidate_urls(normalized_target, verify_ssl=verify_ssl)
     tls_verification_failed = False
+    known_skip_tls_verify = None if verify_ssl else skip_tls_verify
 
     for candidate in candidates:
-        success, cert_failed = probe_manager_url(candidate, verify_tls=True)
+        if known_skip_tls_verify and candidate.startswith("https://"):
+            # The endpoint is known to serve a certificate this trust store cannot
+            # verify. A verified handshake would only abort with an UnknownCA alert.
+            insecure_success, _ = probe_manager_url(candidate, verify_tls=False, headers=headers)
+            if insecure_success:
+                return candidate, True
+            continue
+        success, cert_failed = probe_manager_url(candidate, verify_tls=True, headers=headers)
         if success:
             return candidate, False
         if candidate.startswith("https://") and cert_failed and not verify_ssl:
-            insecure_success, _ = probe_manager_url(candidate, verify_tls=False)
+            insecure_success, _ = probe_manager_url(candidate, verify_tls=False, headers=headers)
             if insecure_success:
                 return candidate, True
             tls_verification_failed = True
@@ -203,6 +341,13 @@ def _docker_env(docker_config_dir: Optional[Path] = None) -> Dict[str, str]:
 
 
 def _inspect_docker_context(context_name: str, docker_config_dir: Optional[Path] = None) -> Optional[Dict[str, object]]:
+    cache_key = (context_name, str(docker_config_dir or os.getenv("DOCKER_CONFIG", "")))
+    if cache_key not in _CONTEXT_INSPECT_CACHE:
+        _CONTEXT_INSPECT_CACHE[cache_key] = _read_docker_context(context_name, docker_config_dir)
+    return _CONTEXT_INSPECT_CACHE[cache_key]
+
+
+def _read_docker_context(context_name: str, docker_config_dir: Optional[Path] = None) -> Optional[Dict[str, object]]:
     inspect = subprocess.run(
         ["docker", "context", "inspect", context_name],
         text=True,
@@ -256,6 +401,42 @@ def docker_context_target(context_name: str, docker_config_dir: Optional[Path] =
     return _docker_context_host(_inspect_docker_context(context_name, docker_config_dir))
 
 
+def _resolve_manager_endpoint(
+    target: str,
+    *,
+    verify_ssl: bool = False,
+    context_name: Optional[str] = None,
+    docker_config_dir: Optional[Path] = None,
+) -> tuple[str, bool]:
+    """Resolve the manager URL, avoiding probes when the endpoint is already configured."""
+    normalized_target = normalize_manager_target(target)
+    headers = docker_config_http_headers(docker_config_dir)
+    hint = None
+    if not verify_ssl:
+        hint = _skip_tls_verify_hint(
+            normalized_target,
+            context_name=context_name,
+            docker_config_dir=docker_config_dir,
+        )
+        if hint is not None:
+            candidates = _candidate_urls(normalized_target, verify_ssl=False)
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                return candidate, hint if candidate.startswith("https://") else False
+            if hint:
+                # Skipping verification only applies to a TLS endpoint, so the
+                # scheme is settled too and no candidate probing is needed.
+                for candidate in candidates:
+                    if candidate.startswith("https://"):
+                        return candidate, True
+    return detect_manager_url(
+        normalized_target,
+        verify_ssl=verify_ssl,
+        skip_tls_verify=hint,
+        headers=headers,
+    )
+
+
 def resolve_login_config(
     *,
     manager_url: Optional[str] = None,
@@ -285,19 +466,45 @@ def resolve_login_config(
             inferred_context_name = manager_target
             if isolated_context_target:
                 resolved_docker_config_dir = isolated_config_dir
+    endpoint_context_name = (
+        context_name
+        or os.getenv("DOCKER_MANAGER_CONTEXT_NAME")
+        or inferred_context_name
+        or current_context_name
+    )
     if manager_target:
-        resolved_manager_url, skip_tls_verify = detect_manager_url(raw_manager_value, verify_ssl=verify_ssl)
+        resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(
+            raw_manager_value,
+            verify_ssl=verify_ssl,
+            context_name=endpoint_context_name,
+            docker_config_dir=resolved_docker_config_dir,
+        )
     elif manager_url:
         resolved_manager_url = normalize_loopback_host(raw_manager_value)
         skip_tls_verify = False
         if resolved_manager_url.startswith("https://"):
-            _, skip_tls_verify = detect_manager_url(resolved_manager_url, verify_ssl=verify_ssl)
+            _, skip_tls_verify = _resolve_manager_endpoint(
+                resolved_manager_url,
+                verify_ssl=verify_ssl,
+                context_name=endpoint_context_name,
+                docker_config_dir=resolved_docker_config_dir,
+            )
         elif verify_ssl:
             raise RuntimeError("verify_ssl=true requires an HTTPS manager URL")
     elif env_manager_value and "://" not in env_manager_value:
-        resolved_manager_url, skip_tls_verify = detect_manager_url(raw_manager_value, verify_ssl=verify_ssl)
+        resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(
+            raw_manager_value,
+            verify_ssl=verify_ssl,
+            context_name=endpoint_context_name,
+            docker_config_dir=resolved_docker_config_dir,
+        )
     elif current_context_target:
-        resolved_manager_url, skip_tls_verify = detect_manager_url(raw_manager_value, verify_ssl=verify_ssl)
+        resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(
+            raw_manager_value,
+            verify_ssl=verify_ssl,
+            context_name=endpoint_context_name,
+            docker_config_dir=resolved_docker_config_dir,
+        )
     else:
         resolved_manager_url = normalize_loopback_host(raw_manager_value)
         skip_tls_verify = False
@@ -323,7 +530,7 @@ def resolve_context_login_config(
     target = docker_context_target(context_name)
     if not target:
         raise RuntimeError(f"Docker context '{context_name}' does not have a TCP/HTTP(S) Docker endpoint")
-    resolved_manager_url, skip_tls_verify = detect_manager_url(target)
+    resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(target, context_name=context_name)
     return DockerManagerLoginConfig(
         manager_url=resolved_manager_url,
         context_name=context_name,
@@ -343,7 +550,10 @@ def resolve_shell_login_config(
         resolved_context_name = context_name or shell_name
         if not resolved_context_name:
             raise RuntimeError("Pass --context <name> when providing a manager target")
-        resolved_manager_url, skip_tls_verify = detect_manager_url(manager_target)
+        resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(
+            manager_target,
+            context_name=resolved_context_name,
+        )
         return DockerManagerLoginConfig(
             manager_url=resolved_manager_url,
             context_name=resolved_context_name,
@@ -360,7 +570,11 @@ def resolve_shell_login_config(
         target = persisted_target or docker_context_target(resolved_context_name)
         if not target:
             raise UnknownShellContextError(resolved_context_name)
-        resolved_manager_url, skip_tls_verify = detect_manager_url(target)
+        resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(
+            target,
+            context_name=resolved_context_name,
+            docker_config_dir=isolated_docker_config_dir(resolved_context_name) if persisted_target else None,
+        )
         return DockerManagerLoginConfig(
             manager_url=resolved_manager_url,
             context_name=resolved_context_name,
@@ -370,7 +584,10 @@ def resolve_shell_login_config(
 
     current_context_name, current_target = current_docker_context_target()
     if current_context_name and current_target:
-        resolved_manager_url, skip_tls_verify = detect_manager_url(current_target)
+        resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(
+            current_target,
+            context_name=current_context_name,
+        )
         return DockerManagerLoginConfig(
             manager_url=resolved_manager_url,
             context_name=current_context_name,
