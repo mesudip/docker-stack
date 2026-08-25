@@ -25,6 +25,7 @@ class DockerManagerLoginConfig:
     context_name: str
     timeout_secs: int
     skip_tls_verify: bool = False
+    docker_config_dir: Optional[Path] = None
 
     @property
     def docker_context_host(self) -> str:
@@ -267,15 +268,23 @@ def resolve_login_config(
     current_context_name = None
     current_context_target = None
     inferred_context_name = None
+    resolved_docker_config_dir = None
     if not manager_url and not manager_target and not env_manager_value:
         current_context_name, current_context_target = current_docker_context_target()
 
     raw_manager_value = manager_url or manager_target or env_manager_value or current_context_target or "http://localhost:8080"
     if manager_target and "://" not in manager_target and ":" not in manager_target:
-        context_target = docker_context_target(manager_target)
+        isolated_config_dir = isolated_docker_config_dir(manager_target)
+        isolated_context_target = docker_context_target(
+            manager_target,
+            isolated_config_dir,
+        )
+        context_target = isolated_context_target or docker_context_target(manager_target)
         if context_target:
             raw_manager_value = context_target
             inferred_context_name = manager_target
+            if isolated_context_target:
+                resolved_docker_config_dir = isolated_config_dir
     if manager_target:
         resolved_manager_url, skip_tls_verify = detect_manager_url(raw_manager_value, verify_ssl=verify_ssl)
     elif manager_url:
@@ -302,6 +311,7 @@ def resolve_login_config(
         or "dm-proxy",
         timeout_secs=int(timeout_secs or os.getenv("DOCKER_MANAGER_LOGIN_TIMEOUT_SECS", "300")),
         skip_tls_verify=skip_tls_verify,
+        docker_config_dir=resolved_docker_config_dir,
     )
 
 

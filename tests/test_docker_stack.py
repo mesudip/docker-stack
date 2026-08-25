@@ -8,7 +8,15 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from docker_stack.cli import DOCKER_SHELL_ENDPOINT_ENV_VARS, Docker, active_shell_config_dir, open_context_shell
+from docker_stack.cli import (
+    DOCKER_SHELL_ENDPOINT_ENV_VARS,
+    Docker,
+    _managed_docker,
+    _read_selected_node,
+    _select_node,
+    active_shell_config_dir,
+    open_context_shell,
+)
 from docker_stack.helpers import Command
 from docker_stack.login import UnknownShellContextError
 from docker_stack import main
@@ -17,6 +25,134 @@ from docker_stack import main
 def decode_x_files(compose_content):
     data = yaml.safe_load(compose_content)
     return {item["path"]: base64.b64decode(item["content"]).decode("utf-8") for item in data.get("x-files", [])}
+
+
+def test_node_use_updates_only_managed_shell_config(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"HttpHeaders": {"Authorization": "Bearer token"}}), encoding="utf-8")
+    node_state = tmp_path / "node-selection"
+    monkeypatch.setenv("DOCKER_STACK_SHELL_SOCKET", str(tmp_path / "auth.sock"))
+    monkeypatch.setenv("DOCKER_STACK_SHELL_SECRET", "secret")
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
+    monkeypatch.setenv("DOCKER_STACK_SHELL_NODE_STATE", str(node_state))
+    client = SimpleNamespace(
+        list_nodes=lambda: {
+            "nodes": [
+                {"id": "node-worker-123", "hostname": "worker-02", "state": "Ready"},
+            ]
+        }
+    )
+    monkeypatch.setattr("docker_stack.cli._manager_with_cluster_cli", lambda: client)
+
+    assert _select_node("worker-02") == "worker-02"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["HttpHeaders"]["Authorization"] == "Bearer token"
+    assert payload["HttpHeaders"]["X-Docker-Manager-Node"] == "node-worker-123"
+    assert _read_selected_node() == "node-worker-123"
+    assert node_state.read_text(encoding="utf-8").strip() == "worker-02"
+
+    assert _select_node("cluster") == "cluster"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "X-Docker-Manager-Node" not in payload["HttpHeaders"]
+
+
+def test_managed_docker_ps_renders_node_column(monkeypatch, capsys):
+    client = SimpleNamespace(
+        supports=lambda feature: feature == "cluster_container_cli_v1",
+        list_containers=lambda **_kwargs: {
+            "containers": [
+                {
+                    "node_id": "node-1",
+                    "node_name": "worker-02",
+                    "docker": {
+                        "Id": "abcdef1234567890",
+                        "Image": "nginx:1.27",
+                        "Command": "nginx",
+                        "Created": 1,
+                        "Status": "Up 1 hour",
+                        "Ports": [{"PrivatePort": 80, "Type": "tcp"}],
+                        "Names": ["/web.1.test"],
+                    },
+                }
+            ],
+            "node_errors": [],
+        }
+    )
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
+
+    assert _managed_docker(["ps"]) == 0
+    output = capsys.readouterr().out
+    assert "CONTAINER ID" in output
+    assert "NODE" in output
+    assert "worker-02" in output
+    assert "abcdef123456" in output
+
+
+def test_managed_docker_ps_forwards_global_latest_and_limit(monkeypatch):
+    calls = []
+    client = SimpleNamespace(
+        supports=lambda feature: feature == "cluster_container_cli_v1",
+        list_containers=lambda **kwargs: calls.append(kwargs)
+        or {"containers": [], "node_errors": []},
+    )
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
+
+    assert _managed_docker(["ps", "--latest"]) == 0
+    assert _managed_docker(["ps", "--last", "3"]) == 0
+
+    assert calls[0]["latest"] is True
+    assert calls[0]["limit"] is None
+    assert calls[1]["latest"] is False
+    assert calls[1]["limit"] == 3
+
+
+def test_managed_docker_delegates_format_to_real_docker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "docker_stack.cli.subprocess.run",
+        lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=7),
+    )
+
+    assert _managed_docker(["ps", "--format", "{{.ID}}"]) == 7
+    assert calls == [["docker", "ps", "--format", "{{.ID}}"]]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--context", "other", "ps"],
+        ["--context=other", "ps"],
+        ["-H", "tcp://other:2375", "ps"],
+        ["-H=tcp://other:2375", "ps"],
+        ["--config", "/tmp/other-docker-config", "ps"],
+    ],
+)
+def test_managed_docker_delegates_explicit_target_overrides(monkeypatch, arguments):
+    calls = []
+    monkeypatch.setattr(
+        "docker_stack.cli.subprocess.run",
+        lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=6),
+    )
+    monkeypatch.setattr(
+        "docker_stack.cli.discover_manager_client",
+        lambda: pytest.fail("explicit Docker targets must bypass managed cluster discovery"),
+    )
+
+    assert _managed_docker(arguments) == 6
+    assert calls == [["docker", *arguments]]
+
+
+def test_managed_docker_ps_delegates_when_manager_lacks_cluster_feature(monkeypatch):
+    calls = []
+    client = SimpleNamespace(supports=lambda _feature: False)
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
+    monkeypatch.setattr(
+        "docker_stack.cli.subprocess.run",
+        lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=9),
+    )
+
+    assert _managed_docker(["ps"]) == 9
+    assert calls == [["docker", "ps"]]
 
 
 class RecordingManager:
@@ -1023,6 +1159,37 @@ def test_login_prefers_existing_context_for_portless_target(monkeypatch, capsys)
     assert "DOCKER_CONTEXT=office" in output
 
 
+def test_login_named_context_reuses_persisted_isolated_config(monkeypatch, tmp_path, capsys):
+    (tmp_path / "config.json").write_text("{}\n", encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(
+        "docker_stack.cli.resolve_login_config",
+        lambda **_kwargs: SimpleNamespace(
+            manager_url="https://172.31.3.3:2376",
+            context_name="saas-a",
+            docker_context_host="tcp://172.31.3.3:2376",
+            skip_tls_verify=False,
+            docker_config_dir=tmp_path,
+        ),
+    )
+
+    def fake_ensure(config, docker_config_dir=None):
+        captured["context"] = config.context_name
+        captured["config_dir"] = docker_config_dir
+        return docker_config_dir, None
+
+    monkeypatch.setattr("docker_stack.cli.ensure_isolated_login", fake_ensure)
+    monkeypatch.setattr(
+        "docker_stack.cli.docker_manager_login",
+        lambda _config: pytest.fail("named persisted login must not use global Docker config"),
+    )
+
+    main(["login", "saas-a"])
+
+    assert captured == {"context": "saas-a", "config_dir": tmp_path}
+    assert f"DOCKER_CONFIG={tmp_path}" in capsys.readouterr().out
+
+
 def test_login_inside_shell_updates_existing_isolated_config(monkeypatch, tmp_path, capsys):
     captured = {}
 
@@ -1165,6 +1332,27 @@ def test_shell_unknown_context_prompts_for_manager_url_and_creates_it(monkeypatc
     output = capsys.readouterr().out
     assert "Docker context 'prod1' does not exist yet" in output
     assert "Creating Docker-Manager shell context 'prod1'" in output
+
+
+def test_shell_explicit_target_persists_context_before_opening(monkeypatch):
+    config = SimpleNamespace(
+        manager_url="https://172.31.3.3:2376",
+        context_name="saas-a",
+        docker_context_host="tcp://172.31.3.3:2376",
+        skip_tls_verify=False,
+        timeout_secs=30,
+    )
+    events = []
+    monkeypatch.setattr("docker_stack.cli.resolve_shell_login_config", lambda **_kwargs: config)
+    monkeypatch.setattr("docker_stack.cli.persist_shell_context", lambda value: events.append(("persist", value.context_name)))
+    monkeypatch.setattr("docker_stack.cli.browser_login", lambda _config: events.append(("login", "saas-a")) or SimpleNamespace(expires_at=None))
+    monkeypatch.setattr("docker_stack.cli.run_managed_shell", lambda _config, _result: 0)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["shell", "--context", "saas-a", "https://172.31.3.3:2376"])
+
+    assert excinfo.value.code == 0
+    assert events[:2] == [("persist", "saas-a"), ("login", "saas-a")]
 
 
 def test_shell_inside_same_context_reports_already_active(monkeypatch, capsys):

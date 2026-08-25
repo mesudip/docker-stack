@@ -139,10 +139,39 @@ Stack commands use the `default` namespace unless `-n/--namespace` is supplied.
 Listings print the selected namespace; `docker-stack ls -A` (or
 `--all-namespaces`) lists every visible namespace.
 
-The prompt displays `(docker:office)`, keeps the selected manager context active,
+The prompt displays `(docker:office@cluster)`, keeps the selected manager context active,
 and refreshes authentication when needed. The session supports `docker` and
 `docker compose`; legacy `docker-compose` is not supported. If authentication
 expires, run `docker-stack login` again.
+
+Container listing is cluster-aware and includes the owning Swarm node. Select a
+node when working with daemon-local resources such as volumes and images:
+
+```bash
+docker ps
+docker-stack node current
+docker-stack node use worker-02
+docker volume ls
+docker image ls
+docker-stack node use cluster
+```
+
+Node selection is stored only in the managed shell's isolated Docker
+configuration and appears in the prompt as `(docker:office@worker-02)`.
+Selected-node requests remain subject to the manager's Docker permissions;
+image management is root-only because the manager does not define delegated
+image permissions.
+
+Cluster-aware output is enabled after the manager has observed compatible
+agents on every discovered node. The manager remembers that capability until it
+restarts, so a temporary agent outage does not make the CLI revert to a legacy
+feature decision. A partial cluster listing prints the available containers,
+reports each failed node on stderr with its incident id, and exits non-zero.
+
+`docker ps --quiet` and `docker ps --format ...` use Docker's native formatter
+and therefore do not add the `NODE` column. Explicit Docker overrides such as
+`--context`, `--host`/`-H`, and `--config` bypass managed cluster formatting and
+are sent unchanged to the Docker CLI.
 
 ## Core Capabilities
 

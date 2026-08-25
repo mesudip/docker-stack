@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -289,8 +290,60 @@ def test_prompt_hooks_only_read_local_status_and_docker_wrapper_preflights(tmp_p
     wrapper = (tmp_path / "bashrc").read_text(encoding="utf-8")
     prompt_function = wrapper.split("__docker_stack_prompt_update() {", 1)[1].split("}", 1)[0]
     assert "shell-auth" not in prompt_function
-    assert "docker-stack shell-auth ensure || return $?; command docker \"$@\"" in wrapper
-    assert "(docker:office)" in wrapper
+    assert "docker-stack shell-auth ensure || return $?; docker-stack docker -- \"$@\"" in wrapper
+    assert "(docker:office@${node})" in wrapper
+    assert "(docker:!DOCKER_HOST)" in wrapper
+
+    zsh_wrapper = (tmp_path / "zsh" / ".zshrc").read_text(encoding="utf-8")
+    assert '[[ -n "${DOCKER_HOST:-}" ]]' in zsh_wrapper
+    assert "(docker:!DOCKER_HOST)" in zsh_wrapper
+    assert f"typeset -g HISTFILE={json.dumps(str(tmp_path / '.zsh_history'))}" in zsh_wrapper
+    assert '[[ -r "$HISTFILE" ]] && fc -R "$HISTFILE"' in zsh_wrapper
+
+
+def test_zsh_wrapper_loads_and_persists_original_history(tmp_path, monkeypatch):
+    zsh = shutil.which("zsh")
+    if zsh is None:
+        pytest.skip("zsh is not installed")
+
+    original_zdotdir = tmp_path / "original-zdotdir"
+    original_zdotdir.mkdir()
+    (original_zdotdir / ".zshrc").write_text(
+        "HISTSIZE=100\nSAVEHIST=100\nsetopt append_history\n",
+        encoding="utf-8",
+    )
+    history_path = original_zdotdir / ".zsh_history"
+    history_path.write_text(": 1:0;existing-managed-shell-history\n", encoding="utf-8")
+    status_path = tmp_path / "status"
+    status_path.write_text("active 9999999999\n", encoding="utf-8")
+
+    monkeypatch.setenv("ZDOTDIR", str(original_zdotdir))
+    wrapper_env = _write_shell_wrappers(
+        tmp_path,
+        zsh,
+        context_name="office",
+        status_path=status_path,
+    )
+    env = dict(os.environ)
+    env.update(wrapper_env)
+    env.pop("TERM_SESSION_ID", None)
+
+    result = subprocess.run(
+        [
+            zsh,
+            "-i",
+            "-c",
+            'fc -l 1; print -s "persisted-managed-shell-history"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "existing-managed-shell-history" in result.stdout
+    assert "persisted-managed-shell-history" in history_path.read_text(encoding="utf-8")
 
 
 def test_broker_stop_erases_in_memory_credentials_and_socket(tmp_path, monkeypatch):

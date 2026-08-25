@@ -32,6 +32,7 @@ SHELL_SOCKET_ENV = "DOCKER_STACK_SHELL_SOCKET"
 SHELL_SECRET_ENV = "DOCKER_STACK_SHELL_SECRET"
 SHELL_CONTEXT_ENV = "DOCKER_STACK_SHELL_CONTEXT"
 SHELL_STATUS_ENV = "DOCKER_STACK_SHELL_STATUS"
+SHELL_NODE_STATE_ENV = "DOCKER_STACK_SHELL_NODE_STATE"
 SHELL_ORIGINAL_ZDOTDIR_ENV = "DOCKER_STACK_SHELL_ORIGINAL_ZDOTDIR"
 SHELL_AUTH_TIMEOUT_ENV = "DOCKER_STACK_SHELL_AUTH_TIMEOUT_SECS"
 
@@ -530,9 +531,11 @@ def _write_shell_wrappers(
     *,
     context_name: str,
     status_path: Path,
+    node_state_path: Optional[Path] = None,
 ) -> Dict[str, str]:
     context = _prompt_context(context_name)
     status_path_value = str(status_path)
+    node_state_path_value = str(node_state_path or status_path.with_name("node-selection"))
     no_color = bool(os.getenv("NO_COLOR"))
     bash_rc = session_dir / "bashrc"
     zsh_dir = session_dir / "zsh"
@@ -542,11 +545,18 @@ def _write_shell_wrappers(
         os.getenv(SHELL_ORIGINAL_ZDOTDIR_ENV) or os.getenv("ZDOTDIR", str(Path.home()))
     )
     original_zshrc = original_zshrc_root / ".zshrc"
+    original_zsh_history = original_zshrc_root / ".zsh_history"
     bash_rc.write_text(
         f'''[ -f {json.dumps(str(original_bashrc))} ] && source {json.dumps(str(original_bashrc))}
 __docker_stack_base_ps1="$PS1"
 __docker_stack_prompt_update() {{
-  local state expires now color reset
+  local state expires now color reset node
+  if [ -n "${{DOCKER_HOST:-}}" ]; then
+    color='\\[\\e[31m\\]'; reset='\\[\\e[0m\\]'
+    [ {str(no_color).lower()} = true ] && color= && reset=
+    PS1="${{color}}(docker:!DOCKER_HOST)${{reset}} ${{__docker_stack_base_ps1}}"
+    return
+  fi
   read -r state expires < {json.dumps(status_path_value)} 2>/dev/null || state=error
   now=$(date +%s)
   if [ "$state" = active ] && [ "${{expires:-0}}" -gt $((now + {REFRESH_WINDOW_SECS})) ]; then color='\\[\\e[32m\\]';
@@ -554,21 +564,35 @@ __docker_stack_prompt_update() {{
   else color='\\[\\e[31m\\]'; fi
   reset='\\[\\e[0m\\]'
   [ {str(no_color).lower()} = true ] && color= && reset=
-  PS1="${{color}}(docker:{context})${{reset}} ${{__docker_stack_base_ps1}}"
+  node=$(cat {json.dumps(node_state_path_value)} 2>/dev/null || printf cluster)
+  PS1="${{color}}(docker:{context}@${{node}})${{reset}} ${{__docker_stack_base_ps1}}"
 }}
 case ";${{PROMPT_COMMAND:-}};" in *';__docker_stack_prompt_update;'*) ;; *) PROMPT_COMMAND="__docker_stack_prompt_update${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}";; esac
-docker() {{ docker-stack shell-auth ensure || return $?; command docker "$@"; }}
+docker() {{ docker-stack shell-auth ensure || return $?; docker-stack docker -- "$@"; }}
 ''',
         encoding="utf-8",
     )
     os.chmod(bash_rc, 0o600)
     zsh_rc = zsh_dir / ".zshrc"
     zsh_rc.write_text(
-        f'''[ -f {json.dumps(str(original_zshrc))} ] && source {json.dumps(str(original_zshrc))}
+        f'''typeset -g __docker_stack_session_zdotdir="$ZDOTDIR"
+typeset -g ZDOTDIR={json.dumps(str(original_zshrc_root))}
+typeset -g HISTFILE={json.dumps(str(original_zsh_history))}
+typeset -g SHELL_SESSION_HISTORY=0
+[ -f {json.dumps(str(original_zshrc))} ] && source {json.dumps(str(original_zshrc))}
+[[ -r "$HISTFILE" ]] && fc -R "$HISTFILE"
+typeset -g ZDOTDIR="$__docker_stack_session_zdotdir"
+unset __docker_stack_session_zdotdir
 autoload -Uz add-zsh-hook
 typeset -g __docker_stack_base_prompt="$PROMPT"
 __docker_stack_prompt_update() {{
-  local state expires now color reset
+  local state expires now color reset node
+  if [[ -n "${{DOCKER_HOST:-}}" ]]; then
+    color='%F{{red}}'; reset='%f'
+    [[ -n "${{NO_COLOR:-}}" ]] && color= && reset=
+    PROMPT="${{color}}(docker:!DOCKER_HOST)${{reset}} ${{__docker_stack_base_prompt}}"
+    return
+  fi
   read -r state expires < {json.dumps(status_path_value)} 2>/dev/null || state=error
   now=$(date +%s)
   if [[ "$state" = active && "${{expires:-0}}" -gt $((now + {REFRESH_WINDOW_SECS})) ]]; then color='%F{{green}}';
@@ -576,10 +600,11 @@ __docker_stack_prompt_update() {{
   else color='%F{{red}}'; fi
   reset='%f'
   [[ -n "${{NO_COLOR:-}}" ]] && color= && reset=
-  PROMPT="${{color}}(docker:{context})${{reset}} ${{__docker_stack_base_prompt}}"
+  node=$(cat {json.dumps(node_state_path_value)} 2>/dev/null || printf cluster)
+  PROMPT="${{color}}(docker:{context}@${{node}})${{reset}} ${{__docker_stack_base_prompt}}"
 }}
 add-zsh-hook precmd __docker_stack_prompt_update
-docker() {{ docker-stack shell-auth ensure || return $?; command docker "$@"; }}
+docker() {{ docker-stack shell-auth ensure || return $?; docker-stack docker -- "$@"; }}
 ''',
         encoding="utf-8",
     )
@@ -638,6 +663,9 @@ def run_managed_shell(config: DockerManagerLoginConfig, result: DockerManagerLog
         update_access_header(config_path, result.access_token)
         socket_path = session_dir / "auth.sock"
         status_path = session_dir / "status"
+        node_state_path = session_dir / "node-selection"
+        node_state_path.write_text("cluster\n", encoding="utf-8")
+        os.chmod(node_state_path, 0o600)
         shell_secret = os.urandom(32).hex()
         broker_env = dict(os.environ)
         for key in (SHELL_SOCKET_ENV, SHELL_SECRET_ENV, SHELL_CONTEXT_ENV, SHELL_STATUS_ENV):
@@ -689,12 +717,14 @@ def run_managed_shell(config: DockerManagerLoginConfig, result: DockerManagerLog
             shell,
             context_name=config.context_name,
             status_path=status_path,
+            node_state_path=node_state_path,
         )
         env = dict(os.environ)
         env[SHELL_SOCKET_ENV] = str(socket_path)
         env[SHELL_SECRET_ENV] = shell_secret
         env[SHELL_CONTEXT_ENV] = config.context_name
         env[SHELL_STATUS_ENV] = str(status_path)
+        env[SHELL_NODE_STATE_ENV] = str(node_state_path)
         env[SHELL_AUTH_TIMEOUT_ENV] = str(max(1, config.timeout_secs) + 5)
         env.update(wrapper_env)
         for key in ("DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION", "DOCKER_MACHINE_NAME"):

@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import os
 import yaml
 import json
+import time
 from docker_stack.docker_objects import DockerConfig, DockerObjectManager, DockerSecret
 from docker_stack.helpers import CallbackCommand, Command, generate_secret, run_cli_command
 from docker_stack.login import (
@@ -28,6 +29,7 @@ from docker_stack.login import (
 )
 from docker_stack.shell_auth import (
     SHELL_CONTEXT_ENV,
+    SHELL_NODE_STATE_ENV,
     ShellAuthError,
     ensure_shell_access,
     login_for_active_shell,
@@ -35,6 +37,7 @@ from docker_stack.shell_auth import (
     shell_session_active,
 )
 from docker_stack.manager_api import (
+    FEATURE_CLUSTER_CONTAINER_CLI,
     FEATURE_STACK_DEPLOY,
     FEATURE_STACK_QUERY,
     ManagerApiClient,
@@ -51,6 +54,232 @@ DOCKER_SHELL_ENDPOINT_ENV_VARS = (
     "DOCKER_MACHINE_NAME",
 )
 DEFAULT_NAMESPACE = "default"
+NODE_HEADER = "X-Docker-Manager-Node"
+
+
+def _active_docker_config_path() -> Path:
+    if not shell_session_active():
+        raise RuntimeError("node selection is available only inside docker-stack shell")
+    config_root = os.getenv("DOCKER_CONFIG", "").strip()
+    if not config_root:
+        raise RuntimeError("managed shell Docker configuration is unavailable")
+    return Path(config_root) / "config.json"
+
+
+def _read_selected_node() -> str:
+    config_path = _active_docker_config_path()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"failed reading managed Docker configuration: {exc}") from exc
+    headers = payload.get("HttpHeaders")
+    value = headers.get(NODE_HEADER) if isinstance(headers, dict) else None
+    return str(value).strip() if value else "cluster"
+
+
+def _write_selected_node(value: Optional[str], display_name: str) -> None:
+    config_path = _active_docker_config_path()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"failed reading managed Docker configuration: {exc}") from exc
+    headers = payload.get("HttpHeaders")
+    headers = dict(headers) if isinstance(headers, dict) else {}
+    if value:
+        headers[NODE_HEADER] = value
+    else:
+        headers.pop(NODE_HEADER, None)
+    if headers:
+        payload["HttpHeaders"] = headers
+    else:
+        payload.pop("HttpHeaders", None)
+    temporary = config_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, config_path)
+    node_state = os.getenv(SHELL_NODE_STATE_ENV, "").strip()
+    if node_state:
+        Path(node_state).write_text(f"{display_name}\n", encoding="utf-8")
+
+
+def _manager_with_cluster_cli() -> ManagerApiClient:
+    client = discover_manager_client()
+    if client is None or not client.supports(FEATURE_CLUSTER_CONTAINER_CLI):
+        raise RuntimeError("Docker-Manager does not support cluster container CLI; upgrade the manager and all node agents")
+    return client
+
+
+def _select_node(value: str) -> str:
+    client = _manager_with_cluster_cli()
+    requested = value.strip()
+    if requested.lower() == "cluster":
+        _write_selected_node(None, "cluster")
+        return "cluster"
+    nodes = client.list_nodes().get("nodes", [])
+    exact = [node for node in nodes if str(node.get("id") or "") == requested]
+    candidates = exact or [
+        node
+        for node in nodes
+        if str(node.get("id") or "").startswith(requested)
+        or str(node.get("hostname") or "") == requested
+    ]
+    if not candidates:
+        raise RuntimeError(f"node '{requested}' is not visible or does not exist")
+    if len(candidates) != 1:
+        names = ", ".join(str(node.get("hostname") or node.get("id")) for node in candidates)
+        raise RuntimeError(f"node '{requested}' is ambiguous: {names}")
+    node = candidates[0]
+    if str(node.get("state") or "").lower() != "ready":
+        raise RuntimeError(f"node '{requested}' is not ready")
+    node_id = str(node.get("id") or "").strip()
+    hostname = str(node.get("hostname") or node_id).strip()
+    _write_selected_node(node_id, hostname)
+    return hostname
+
+
+def _human_age(timestamp: object) -> str:
+    try:
+        seconds = max(0, int(time.time()) - int(timestamp))
+    except (TypeError, ValueError):
+        return "-"
+    if seconds < 60:
+        return f"{seconds} seconds ago"
+    if seconds < 3600:
+        return f"{seconds // 60} minutes ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} hours ago"
+    return f"{seconds // 86400} days ago"
+
+
+def _format_ports(ports: object) -> str:
+    if not isinstance(ports, list):
+        return ""
+    values = []
+    for port in ports:
+        if not isinstance(port, dict):
+            continue
+        private = port.get("PrivatePort")
+        protocol = port.get("Type") or "tcp"
+        public = port.get("PublicPort")
+        address = port.get("IP") or "0.0.0.0"
+        values.append(f"{address}:{public}->{private}/{protocol}" if public is not None else f"{private}/{protocol}")
+    return ", ".join(values)
+
+
+def _print_cluster_containers(payload: Dict[str, object], *, no_trunc: bool = False, show_size: bool = False) -> int:
+    rows = []
+    for entry in payload.get("containers", []):
+        if not isinstance(entry, dict) or not isinstance(entry.get("docker"), dict):
+            continue
+        item = entry["docker"]
+        container_id = str(item.get("Id") or "-")
+        names = item.get("Names") if isinstance(item.get("Names"), list) else []
+        row = {
+            "CONTAINER ID": container_id if no_trunc else container_id[:12],
+            "IMAGE": str(item.get("Image") or "-"),
+            "COMMAND": str(item.get("Command") or "-"),
+            "CREATED": _human_age(item.get("Created")),
+            "STATUS": str(item.get("Status") or item.get("State") or "-"),
+            "PORTS": _format_ports(item.get("Ports")),
+            "NAMES": ",".join(str(name).lstrip("/") for name in names) or "-",
+            "NODE": str(entry.get("node_name") or entry.get("node_id") or "-"),
+        }
+        if show_size:
+            row["SIZE"] = str(item.get("SizeRw") if item.get("SizeRw") is not None else "-")
+        rows.append(row)
+    columns = ["CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"]
+    if show_size:
+        columns.append("SIZE")
+    columns.append("NODE")
+    widths = {column: max(len(column), max((len(row[column]) for row in rows), default=0)) for column in columns}
+    print("   ".join(column.ljust(widths[column]) for column in columns))
+    for row in rows:
+        print("   ".join(row[column].ljust(widths[column]) for column in columns))
+    errors = payload.get("node_errors") if isinstance(payload.get("node_errors"), list) else []
+    for error in errors:
+        if isinstance(error, dict):
+            print(
+                f"docker ps: node {error.get('node_name') or error.get('node_id')}: {error.get('message')} "
+                f"(incident: {error.get('incident_id')})",
+                file=sys.stderr,
+            )
+    return 1 if errors else 0
+
+
+def _managed_docker(arguments: List[str]) -> int:
+    values = list(arguments)
+    if values and values[0] == "--":
+        values.pop(0)
+    command_index = 0
+    while command_index < len(values) and values[command_index].startswith("-"):
+        option = values[command_index]
+        if option in {"--config", "--context", "--host", "-H", "--log-level"}:
+            command_index += 2
+        else:
+            command_index += 1
+    command = values[command_index:]
+    global_options = values[:command_index]
+    explicit_target = any(
+        value in {"--config", "--context", "-c", "--host", "-H"}
+        or value.startswith(("--config=", "--context=", "--host=", "-H="))
+        or (value.startswith("-H") and value != "-H")
+        or (value.startswith("-c") and value != "-c")
+        for value in global_options
+    )
+    is_ps = bool(command) and (
+        command[0] == "ps"
+        or (len(command) >= 2 and command[0] == "container" and command[1] in {"ls", "list"})
+    )
+    if explicit_target or not is_ps or any(
+        value in {"-q", "--quiet", "--format"} or value.startswith("--format=")
+        for value in command
+    ):
+        return subprocess.run(["docker", *values], check=False).returncode
+    try:
+        client = discover_manager_client()
+        if client is None or not client.supports(FEATURE_CLUSTER_CONTAINER_CLI):
+            return subprocess.run(["docker", *values], check=False).returncode
+        filters = []
+        all_containers = False
+        latest = False
+        limit = None
+        no_trunc = False
+        show_size = False
+        index = 1 if command[0] == "ps" else 2
+        while index < len(command):
+            value = command[index]
+            if value in {"-a", "--all"}:
+                all_containers = True
+            elif value in {"-l", "--latest"}:
+                latest = True
+            elif value == "--no-trunc":
+                no_trunc = True
+            elif value in {"-s", "--size"}:
+                show_size = True
+            elif value in {"-f", "--filter"} and index + 1 < len(command):
+                index += 1
+                filters.append(command[index])
+            elif value.startswith("--filter="):
+                filters.append(value.split("=", 1)[1])
+            elif value in {"-n", "--last"} and index + 1 < len(command):
+                index += 1
+                limit = int(command[index])
+            elif value.startswith("--last="):
+                limit = int(value.split("=", 1)[1])
+            else:
+                return subprocess.run(["docker", *values], check=False).returncode
+            index += 1
+        payload = client.list_containers(
+            all_containers=all_containers,
+            filters=filters,
+            limit=limit,
+            latest=latest,
+            size=show_size,
+        )
+        return _print_cluster_containers(payload, no_trunc=no_trunc, show_size=show_size)
+    except (RuntimeError, ValueError) as exc:
+        print(f"docker ps: {exc}", file=sys.stderr)
+        return 2
 
 
 def physical_stack_name(namespace: str, stack: str) -> str:
@@ -1519,6 +1748,9 @@ def main(args: List[str] = None):
     shell_auth_parser = subparsers.add_parser("shell-auth", help=argparse.SUPPRESS)
     shell_auth_parser.add_argument("operation", choices=("ensure", "status"), help=argparse.SUPPRESS)
 
+    docker_parser = subparsers.add_parser("docker", help=argparse.SUPPRESS)
+    docker_parser.add_argument("docker_args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+
     # Build subcommand
     build_parser = subparsers.add_parser("build", help="Build images using docker-compose")
     build_parser.add_argument("compose_file", help="Path to the compose file")
@@ -1563,6 +1795,9 @@ def main(args: List[str] = None):
     node_parser = subparsers.add_parser("node", help="Inspect Docker Swarm nodes")
     node_subparsers = node_parser.add_subparsers(dest="node_command", required=True)
     node_subparsers.add_parser("ls", help="List Docker Swarm nodes and their labels")
+    node_subparsers.add_parser("current", help="Show the node selected in this managed shell")
+    node_use_parser = node_subparsers.add_parser("use", help="Select a node for node-local Docker commands")
+    node_use_parser.add_argument("node", help="Node id, id prefix, hostname, or 'cluster'")
 
     cat_parser = subparsers.add_parser(
         "cat", help="Print the docker compose of specific version. Defaults to latest version if not specified."
@@ -1611,6 +1846,9 @@ def main(args: List[str] = None):
             return 2
         return 0
 
+    if args.command == "docker":
+        return _managed_docker(args.docker_args)
+
     if args.command == "login":
         try:
             config = resolve_login_config(
@@ -1620,6 +1858,8 @@ def main(args: List[str] = None):
                 timeout_secs=args.timeout_secs,
             )
             current_shell_config = active_shell_config_dir(config.context_name)
+            if current_shell_config is None:
+                current_shell_config = getattr(config, "docker_config_dir", None)
             if shell_session_active():
                 result = login_for_active_shell(config)
                 config_dir = current_shell_config
@@ -1670,6 +1910,9 @@ def main(args: List[str] = None):
                     timeout_secs=args.timeout_secs,
                 )
                 persist_shell_context(config)
+            else:
+                if manager_target is not None:
+                    persist_shell_context(config)
             if shell_session_active() and os.getenv(SHELL_CONTEXT_ENV) == config.context_name:
                 print(f"docker-stack shell context={config.context_name} is already active")
                 return
@@ -1762,6 +2005,19 @@ def main(args: List[str] = None):
         elif args.command == "node":
             if args.node_command == "ls":
                 docker.node.ls()
+            elif args.node_command == "current":
+                try:
+                    print(_read_selected_node())
+                except RuntimeError as exc:
+                    print(f"docker-stack node current: {exc}", file=sys.stderr)
+                    return 2
+            elif args.node_command == "use":
+                try:
+                    selected = _select_node(args.node)
+                except RuntimeError as exc:
+                    print(f"docker-stack node use: {exc}", file=sys.stderr)
+                    return 2
+                print(f"Docker node selection: {selected}")
 
         elif args.command == "rm":
             docker.stack.rm(args.stack_name, namespace=args.namespace)

@@ -384,6 +384,26 @@ def test_resolve_login_config_prefers_named_context_for_portless_target(monkeypa
     assert config.skip_tls_verify is True
 
 
+def test_resolve_login_config_prefers_isolated_named_context(monkeypatch, tmp_path):
+    monkeypatch.setattr("docker_stack.login.isolated_docker_config_dir", lambda _name: tmp_path)
+    monkeypatch.setattr(
+        "docker_stack.login.docker_context_target",
+        lambda context_name, docker_config_dir=None: (
+            "tcp://172.31.3.3:2376" if context_name == "saas-a" and docker_config_dir == tmp_path else None
+        ),
+    )
+    monkeypatch.setattr(
+        "docker_stack.login.detect_manager_url",
+        lambda value, verify_ssl=False: ("https://172.31.3.3:2376", False),
+    )
+
+    config = resolve_login_config(manager_target="saas-a")
+
+    assert config.manager_url == "https://172.31.3.3:2376"
+    assert config.context_name == "saas-a"
+    assert config.docker_config_dir == tmp_path
+
+
 def test_resolve_login_config_uses_current_context_target(monkeypatch):
     monkeypatch.setattr(
         "docker_stack.login.current_docker_context_target",

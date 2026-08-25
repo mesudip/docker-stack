@@ -18,6 +18,7 @@ from docker_stack.shell_auth import ensure_shell_access
 FEATURE_MESUDIP_DOCKER_ENTERPRISE = "mesudip-docker-enterprise-v1"
 FEATURE_STACK_QUERY = "docker_stack_query_v1"
 FEATURE_STACK_DEPLOY = "docker_stack_deploy_v1"
+FEATURE_CLUSTER_CONTAINER_CLI = "cluster_container_cli_v1"
 DEFAULT_NAMESPACE = "default"
 
 
@@ -490,6 +491,7 @@ class ManagerApiClient:
 
             nodes.append(
                 {
+                    "id": str(item.get("ID") or ""),
                     "hostname": str(description.get("Hostname") or spec.get("Name") or item.get("ID") or "-"),
                     "role": role,
                     "manager_status": manager_status,
@@ -501,6 +503,39 @@ class ManagerApiClient:
             )
 
         return {"nodes": nodes}
+
+    def list_containers(
+        self,
+        *,
+        all_containers: bool = False,
+        filters: Optional[list[str]] = None,
+        limit: Optional[int] = None,
+        latest: bool = False,
+        size: bool = False,
+    ) -> Dict[str, Any]:
+        docker_filters: Dict[str, list[str]] = {}
+        for raw_filter in filters or []:
+            key, separator, value = raw_filter.partition("=")
+            key = key.strip()
+            if not key or not separator:
+                raise RuntimeError(f"Invalid Docker filter: {raw_filter}")
+            docker_filters.setdefault(key, []).append(value)
+        params: Dict[str, Any] = {
+            "all": "1" if all_containers else "0",
+            "size": "1" if size else "0",
+        }
+        if docker_filters:
+            params["filters"] = json.dumps(docker_filters, separators=(",", ":"))
+        if limit is not None:
+            params["limit"] = str(limit)
+        if latest:
+            params["latest"] = "1"
+        payload = self._request_json(
+            f"/api/docker-stack/containers?{urllib.parse.urlencode(params)}"
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("containers"), list):
+            raise RuntimeError("Docker-Manager containers response is invalid")
+        return payload
 
     def resolve_config(
         self,
