@@ -416,6 +416,22 @@ class ManagerApiClient:
         endpoint_id = self._resolve_endpoint_id()
         return f"/api/endpoints/{endpoint_id}{normalized}"
 
+    def is_manager_backend(self) -> bool:
+        """True when the target is a Docker-Manager stack API rather than a raw daemon."""
+        return self._detect_manager_backend()
+
+    def check_node_agent(self, selector: str) -> Dict[str, Any]:
+        """Report whether one node can serve node-local Docker commands.
+
+        Scoped to ``selector`` on purpose: an unrelated node that is drained, down, or
+        missing its agent must never make a usable node look unusable.
+        """
+        node = urllib.parse.quote(selector, safe="")
+        payload = self._request_json(f"/api/docker-stack/nodes/{node}/agent")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Docker-Manager node agent response is invalid")
+        return payload
+
     def supports(self, feature_name: str) -> bool:
         features = self.detect_features()
         if FEATURE_MESUDIP_DOCKER_ENTERPRISE in features and feature_name in {
@@ -721,7 +737,15 @@ class ManagerApiClient:
         )
 
 
-def discover_manager_client(timeout_secs: int = 5) -> Optional[ManagerApiClient]:
+def discover_manager_client(
+    timeout_secs: int = 5, *, strict: bool = False
+) -> Optional[ManagerApiClient]:
+    """Build a client for the manager behind DOCKER_MANAGER_URL or the Docker context.
+
+    ``strict`` raises the concrete reason instead of returning ``None``. Callers that
+    fall back to the plain Docker CLI want the quiet form; callers that are about to
+    report a failure to the user must not discard why discovery failed.
+    """
     try:
         target = _manager_target_from_env()
         if target:
@@ -729,11 +753,26 @@ def discover_manager_client(timeout_secs: int = 5) -> Optional[ManagerApiClient]
         elif shutil.which("docker"):
             _, context_target = current_docker_context_target()
             if not context_target or not context_target.startswith(("tcp://", "http://", "https://")):
+                if strict:
+                    raise RuntimeError(
+                        "no Docker-Manager endpoint found: set DOCKER_MANAGER_URL, or select a "
+                        f"docker context with a tcp:// endpoint (current target: {context_target or 'none'})"
+                    )
                 return None
             config = resolve_login_config(manager_target=context_target)
         else:
+            if strict:
+                raise RuntimeError(
+                    "no Docker-Manager endpoint found: DOCKER_MANAGER_URL is unset and the docker CLI is not installed"
+                )
             return None
-    except Exception:
+    except RuntimeError:
+        if strict:
+            raise
+        return None
+    except Exception as exc:
+        if strict:
+            raise RuntimeError(f"failed resolving the Docker-Manager endpoint: {exc}") from exc
         return None
 
     return ManagerApiClient(

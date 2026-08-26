@@ -37,7 +37,6 @@ from docker_stack.shell_auth import (
     shell_session_active,
 )
 from docker_stack.manager_api import (
-    FEATURE_CLUSTER_CONTAINER_CLI,
     FEATURE_STACK_DEPLOY,
     FEATURE_STACK_QUERY,
     ManagerApiClient,
@@ -102,15 +101,23 @@ def _write_selected_node(value: Optional[str], display_name: str) -> None:
         Path(node_state).write_text(f"{display_name}\n", encoding="utf-8")
 
 
-def _manager_with_cluster_cli() -> ManagerApiClient:
-    client = discover_manager_client()
-    if client is None or not client.supports(FEATURE_CLUSTER_CONTAINER_CLI):
-        raise RuntimeError("Docker-Manager does not support cluster container CLI; upgrade the manager and all node agents")
+def _require_manager() -> ManagerApiClient:
+    """Return a client for the Docker-Manager behind this shell, or explain why not.
+
+    Only the current manager is supported, so there is no capability negotiation here -
+    either the target is a Docker-Manager or it is a plain Docker daemon.
+    """
+    client = discover_manager_client(strict=True)
+    if client is None or not client.is_manager_backend():
+        raise RuntimeError(
+            f"{client.manager_url if client else 'the current Docker endpoint'} is not a "
+            "Docker-Manager; node-local commands need one"
+        )
     return client
 
 
 def _select_node(value: str) -> str:
-    client = _manager_with_cluster_cli()
+    client = _require_manager()
     requested = value.strip()
     if requested.lower() == "cluster":
         _write_selected_node(None, "cluster")
@@ -133,6 +140,9 @@ def _select_node(value: str) -> str:
         raise RuntimeError(f"node '{requested}' is not ready")
     node_id = str(node.get("id") or "").strip()
     hostname = str(node.get("hostname") or node_id).strip()
+    # Only this node has to be usable. The health of every other node - drained, down, or
+    # missing its agent - is none of this command's business.
+    client.check_node_agent(node_id or hostname)
     _write_selected_node(node_id, hostname)
     return hostname
 
@@ -339,6 +349,13 @@ def _print_cluster_containers(payload: Dict[str, object], *, no_trunc: bool = Fa
         columns.append("SIZE")
     columns.append("NODE")
     _print_table(columns, rows)
+    skipped = payload.get("skipped_nodes") if isinstance(payload.get("skipped_nodes"), list) else []
+    for node in skipped:
+        if isinstance(node, dict):
+            print(
+                f"docker ps: skipped node {node.get('node_name') or node.get('node_id')}: {node.get('reason')}",
+                file=sys.stderr,
+            )
     errors = payload.get("node_errors") if isinstance(payload.get("node_errors"), list) else []
     for error in errors:
         if isinstance(error, dict):
@@ -413,7 +430,7 @@ def _managed_docker(arguments: List[str]) -> int:
         return _exec_docker(values)
     try:
         client = discover_manager_client()
-        if client is None or not client.supports(FEATURE_CLUSTER_CONTAINER_CLI):
+        if client is None or not client.is_manager_backend():
             return _exec_docker(values)
         filters = []
         all_containers = False

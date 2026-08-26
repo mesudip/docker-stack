@@ -38,14 +38,17 @@ def test_node_use_updates_only_managed_shell_config(monkeypatch, tmp_path):
     monkeypatch.setenv("DOCKER_STACK_SHELL_SECRET", "secret")
     monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path))
     monkeypatch.setenv("DOCKER_STACK_SHELL_NODE_STATE", str(node_state))
+    checked = []
     client = SimpleNamespace(
         list_nodes=lambda: {
             "nodes": [
                 {"id": "node-worker-123", "hostname": "worker-02", "state": "Ready"},
             ]
-        }
+        },
+        check_node_agent=lambda selector: checked.append(selector)
+        or {"node_id": selector, "node_name": "worker-02", "agent": "ready"},
     )
-    monkeypatch.setattr("docker_stack.cli._manager_with_cluster_cli", lambda: client)
+    monkeypatch.setattr("docker_stack.cli._require_manager", lambda: client)
 
     assert _select_node("worker-02") == "worker-02"
     payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -54,6 +57,8 @@ def test_node_use_updates_only_managed_shell_config(monkeypatch, tmp_path):
     assert _read_selected_node() == "node-worker-123"
     assert node_state.read_text(encoding="utf-8").strip() == "worker-02"
 
+    assert checked == ["node-worker-123"]
+
     assert _select_node("cluster") == "cluster"
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     assert "X-Docker-Manager-Node" not in payload["HttpHeaders"]
@@ -61,7 +66,7 @@ def test_node_use_updates_only_managed_shell_config(monkeypatch, tmp_path):
 
 def test_managed_docker_ps_renders_node_column(monkeypatch, capsys):
     client = SimpleNamespace(
-        supports=lambda feature: feature == "cluster_container_cli_v1",
+        is_manager_backend=lambda: True,
         list_containers=lambda **_kwargs: {
             "containers": [
                 {
@@ -93,7 +98,7 @@ def test_managed_docker_ps_renders_node_column(monkeypatch, capsys):
 
 def test_managed_docker_ps_matches_docker_columns(monkeypatch, capsys):
     client = SimpleNamespace(
-        supports=lambda feature: feature == "cluster_container_cli_v1",
+        is_manager_backend=lambda: True,
         list_containers=lambda **_kwargs: {
             "containers": [
                 {
@@ -156,7 +161,7 @@ def test_managed_docker_ps_matches_docker_columns(monkeypatch, capsys):
 )
 def test_managed_docker_ps_drops_pinned_digest_like_docker(monkeypatch, capsys, image, expected, expected_no_trunc):
     client = SimpleNamespace(
-        supports=lambda feature: feature == "cluster_container_cli_v1",
+        is_manager_backend=lambda: True,
         list_containers=lambda **_kwargs: {
             "containers": [
                 {
@@ -187,7 +192,7 @@ def test_managed_docker_ps_drops_pinned_digest_like_docker(monkeypatch, capsys, 
 def test_managed_docker_ps_forwards_global_latest_and_limit(monkeypatch):
     calls = []
     client = SimpleNamespace(
-        supports=lambda feature: feature == "cluster_container_cli_v1",
+        is_manager_backend=lambda: True,
         list_containers=lambda **kwargs: calls.append(kwargs)
         or {"containers": [], "node_errors": []},
     )
@@ -292,9 +297,9 @@ def test_managed_docker_delegates_explicit_target_overrides(monkeypatch, argumen
     assert calls == [["docker", *arguments]]
 
 
-def test_managed_docker_ps_delegates_when_manager_lacks_cluster_feature(monkeypatch):
+def test_managed_docker_ps_delegates_when_target_is_not_a_manager(monkeypatch):
     calls = []
-    client = SimpleNamespace(supports=lambda _feature: False)
+    client = SimpleNamespace(is_manager_backend=lambda: False)
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
     monkeypatch.setattr(
         "docker_stack.cli._exec_process",

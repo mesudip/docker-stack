@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `docker-stack node use <node>` no longer fails with "Docker-Manager does not support cluster container CLI". Node selection now checks only the node being selected: an unrelated node that is drained, down, or missing its agent can no longer make a usable node - including the manager's own - look unusable. The failure that is reported is the concrete reason that specific node is unreachable.
+- Endpoint discovery no longer swallows its cause. When a command must report a failure, it says whether no Docker-Manager endpoint could be resolved, or the endpoint is not a Docker-Manager, instead of blaming the manager version.
+- `docker ps` now reports nodes that were skipped because they cannot host the agent, alongside the existing per-node errors.
+
+### Changed
+
+- Only the current Docker-Manager is supported. `cluster_container_cli_v1` is no longer negotiated; the CLI checks that the target is a Docker-Manager rather than which version it is.
+
 ## v2.1.0
 
 ### Added
