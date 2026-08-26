@@ -12,6 +12,8 @@ import yaml
 from docker_stack.cli import (
     DOCKER_SHELL_ENDPOINT_ENV_VARS,
     Docker,
+    _format_runtime_error,
+    _exec_process,
     _managed_docker,
     _read_selected_node,
     _select_node,
@@ -200,11 +202,65 @@ def test_managed_docker_ps_forwards_global_latest_and_limit(monkeypatch):
     assert calls[1]["limit"] == 3
 
 
+def test_exec_process_replaces_the_python_process(monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr("docker_stack.cli.os.execvp", lambda file, args: calls.append((file, args)))
+
+    _exec_process(["docker", "service", "logs", "-f", "svc"])
+
+    assert calls == [("docker", ["docker", "service", "logs", "-f", "svc"])]
+
+
+def test_exec_process_passes_env_when_given(monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr("docker_stack.cli.os.execvpe", lambda file, args, env: calls.append((file, args, env)))
+
+    _exec_process(["/bin/test-shell", "-i"], env={"DOCKER_CONTEXT": "office"})
+
+    assert calls == [("/bin/test-shell", ["/bin/test-shell", "-i"], {"DOCKER_CONTEXT": "office"})]
+
+
+def test_exec_process_reports_missing_binary(monkeypatch, capsys):
+    monkeypatch.setattr(os, "name", "posix")
+
+    def missing(_file, _args):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr("docker_stack.cli.os.execvp", missing)
+
+    assert _exec_process(["docker", "ps"]) == 127
+    assert "cannot execute docker" in capsys.readouterr().err
+
+
+def test_exec_process_falls_back_to_subprocess_off_posix(monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr("docker_stack.cli.os.execvp", lambda *_args: pytest.fail("exec must not run off POSIX"))
+    monkeypatch.setattr(
+        "docker_stack.cli.subprocess.run",
+        lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=3),
+    )
+
+    assert _exec_process(["docker", "ps"]) == 3
+    assert calls == [["docker", "ps"]]
+
+
+def test_main_reports_interrupt_as_shell_exit_code(monkeypatch):
+    def interrupted(_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("docker_stack.cli._run", interrupted)
+
+    assert main(["ps"]) == 130
+
+
 def test_managed_docker_delegates_format_to_real_docker(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        "docker_stack.cli.subprocess.run",
-        lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=7),
+        "docker_stack.cli._exec_process",
+        lambda command, **_kwargs: calls.append(command) or 7,
     )
 
     assert _managed_docker(["ps", "--format", "{{.ID}}"]) == 7
@@ -224,8 +280,8 @@ def test_managed_docker_delegates_format_to_real_docker(monkeypatch):
 def test_managed_docker_delegates_explicit_target_overrides(monkeypatch, arguments):
     calls = []
     monkeypatch.setattr(
-        "docker_stack.cli.subprocess.run",
-        lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=6),
+        "docker_stack.cli._exec_process",
+        lambda command, **_kwargs: calls.append(command) or 6,
     )
     monkeypatch.setattr(
         "docker_stack.cli.discover_manager_client",
@@ -241,8 +297,8 @@ def test_managed_docker_ps_delegates_when_manager_lacks_cluster_feature(monkeypa
     client = SimpleNamespace(supports=lambda _feature: False)
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
     monkeypatch.setattr(
-        "docker_stack.cli.subprocess.run",
-        lambda command, **_kwargs: calls.append(command) or SimpleNamespace(returncode=9),
+        "docker_stack.cli._exec_process",
+        lambda command, **_kwargs: calls.append(command) or 9,
     )
 
     assert _managed_docker(["ps"]) == 9
@@ -1477,18 +1533,16 @@ def test_open_context_shell_clears_endpoint_overrides(monkeypatch, tmp_path):
         monkeypatch.setenv(key, f"parent-{key}")
     monkeypatch.setenv("SHELL", "/bin/test-shell")
 
-    def fake_run(cmd, check, env):
+    def fake_exec(cmd, env=None):
         captured["cmd"] = cmd
-        captured["check"] = check
         captured["env"] = env
-        return SimpleNamespace(returncode=0)
+        return 0
 
-    monkeypatch.setattr("docker_stack.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("docker_stack.cli._exec_process", fake_exec)
 
     assert open_context_shell(tmp_path, "office") == 0
 
     assert captured["cmd"] == ["/bin/test-shell", "-i"]
-    assert captured["check"] is False
     assert captured["env"]["DOCKER_CONFIG"] == str(tmp_path)
     assert captured["env"]["DOCKER_CONTEXT"] == "office"
     for key in DOCKER_SHELL_ENDPOINT_ENV_VARS:
@@ -1573,3 +1627,23 @@ def test_context_use_preserves_auth_when_switching_to_manager(monkeypatch, capsy
     output = capsys.readouterr().out
     assert "DOCKER_CONTEXT=office" in output
     assert "auth header preserved" in output
+
+
+def test_stack_not_found_error_does_not_suggest_ci_setup():
+    formatted = _format_runtime_error(
+        RuntimeError(
+            "Manager request failed (GET /api/docker-stack/stacks/docker-manager/versions?namespace=infra): "
+            'HTTP 404: {"message":"stack not found","incident_id":"d9d372ed","trace_id":"d9d372ed"}'
+        )
+    )
+
+    assert "HTTP 404: stack not found (incident d9d372ed)" in formatted
+    assert '{"message"' not in formatted
+    assert "has no stack by that name in that namespace" in formatted
+    assert "setup action" not in formatted
+
+
+def test_version_probe_failure_still_suggests_manager_url_check():
+    formatted = _format_runtime_error(RuntimeError("Manager request failed (GET /version): connection refused"))
+
+    assert "DOCKER_MANAGER_URL points at a reachable manager" in formatted

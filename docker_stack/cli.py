@@ -350,6 +350,38 @@ def _print_cluster_containers(payload: Dict[str, object], *, no_trunc: bool = Fa
     return 1 if errors else 0
 
 
+def _exec_process(command: List[str], env: Optional[Dict[str, str]] = None) -> int:
+    """Replace this process with ``command`` so it owns the terminal, its signals, and its exit code.
+
+    Proxying through ``subprocess.run`` keeps Python in the foreground process group: Ctrl+C is
+    delivered to the proxy as well as to the child, which surfaces as a ``KeyboardInterrupt``
+    traceback, and a signal-killed child reports a negative return code that ``sys.exit`` turns into
+    a nonsense status (``-2`` becomes ``254`` instead of ``130``). ``exec`` removes the middleman.
+    Only POSIX execs: on Windows ``exec`` detaches the child and hands control straight back, which
+    would break the caller's wait semantics.
+
+    Returns only on failure; the caller keeps its ``int`` contract for that case.
+    """
+    if os.name != "posix":
+        return subprocess.run(command, check=False, env=env).returncode
+    # exec discards Python's buffers, so anything already printed has to reach the fd first.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        if env is None:
+            os.execvp(command[0], command)
+        else:
+            os.execvpe(command[0], command, env)
+    except OSError as exc:
+        print(f"docker-stack: cannot execute {command[0]}: {exc}", file=sys.stderr)
+        return 127
+
+
+def _exec_docker(values: List[str]) -> int:
+    """Hand the command to the real Docker CLI, replacing this process."""
+    return _exec_process(["docker", *values])
+
+
 def _managed_docker(arguments: List[str]) -> int:
     values = list(arguments)
     if values and values[0] == "--":
@@ -378,11 +410,11 @@ def _managed_docker(arguments: List[str]) -> int:
         value in {"-q", "--quiet", "--format"} or value.startswith("--format=")
         for value in command
     ):
-        return subprocess.run(["docker", *values], check=False).returncode
+        return _exec_docker(values)
     try:
         client = discover_manager_client()
         if client is None or not client.supports(FEATURE_CLUSTER_CONTAINER_CLI):
-            return subprocess.run(["docker", *values], check=False).returncode
+            return _exec_docker(values)
         filters = []
         all_containers = False
         latest = False
@@ -411,7 +443,7 @@ def _managed_docker(arguments: List[str]) -> int:
             elif value.startswith("--last="):
                 limit = int(value.split("=", 1)[1])
             else:
-                return subprocess.run(["docker", *values], check=False).returncode
+                return _exec_docker(values)
             index += 1
         payload = client.list_containers(
             all_containers=all_containers,
@@ -1774,7 +1806,7 @@ def open_context_shell(config_dir: Path, context_name: str) -> int:
     env["DOCKER_CONTEXT"] = context_name
     env["DOCKER_MANAGER_CONTEXT_NAME"] = context_name
     shell = env.get("SHELL", "").strip() or "/bin/bash"
-    return subprocess.run([shell, "-i"], check=False, env=env).returncode
+    return _exec_process([shell, "-i"], env=env)
 
 
 def active_shell_config_dir(context_name: str) -> Optional[Path]:
@@ -1805,6 +1837,29 @@ def _error_output(exc: subprocess.CalledProcessError) -> str:
     return "\n".join(value for value in values if value)
 
 
+_MANAGER_VERSION_PROBE_PATTERN = re.compile(r"manager request failed \(\w+ /version\)", re.IGNORECASE)
+
+
+def _humanize_manager_error(message: str) -> str:
+    """Render a manager JSON error body as prose instead of dumping the raw payload."""
+    match = re.search(r"^(.*?: HTTP \d+): (\{.*\})$", message, re.DOTALL)
+    if not match:
+        return message
+    try:
+        body = json.loads(match.group(2))
+    except json.JSONDecodeError:
+        return message
+    if not isinstance(body, dict):
+        return message
+    detail = str(body.get("message", "")).strip()
+    if not detail:
+        return message
+    incident = str(body.get("incident_id") or body.get("trace_id") or "").strip()
+    if incident:
+        return f"{match.group(1)}: {detail} (incident {incident})"
+    return f"{match.group(1)}: {detail}"
+
+
 def _manager_deploy_suggestion(message: str) -> Optional[str]:
     if GITHUB_WORKFLOW_RESTRICTED_MESSAGE in message:
         return (
@@ -1824,10 +1879,16 @@ def _manager_deploy_suggestion(message: str) -> Optional[str]:
             "by this stack. Either allow that external network in the Docker-Manager deployment rule, attach the service to "
             "a stack-owned network, or relabel/recreate the existing network with the expected stack ownership before deploying."
         )
-    if "manager request failed" in lowered and "/version" in lowered:
+    if "stack not found" in lowered:
         return (
-            "Suggestion: check that the manager URL is reachable from the runner and that the setup action exported "
-            "DOCKER_MANAGER_URL and the matching Docker auth headers."
+            "Suggestion: the manager was reached but has no stack by that name in that namespace. "
+            "Run 'docker-stack ls' to list stacks in the current namespace, or 'docker-stack ls -A' to search every namespace."
+        )
+    if _MANAGER_VERSION_PROBE_PATTERN.search(message):
+        return (
+            "Suggestion: docker-stack could not read the manager's /version endpoint. Check that DOCKER_MANAGER_URL points "
+            "at a reachable manager and that the Docker auth headers are set - in CI that means running the docker-stack "
+            "setup action before this step."
         )
     if "docker-manager is configured" in lowered and "did not advertise required feature" in lowered:
         return (
@@ -1841,7 +1902,7 @@ def _format_called_process_error(exc: subprocess.CalledProcessError) -> str:
     output = _error_output(exc)
     lines = [f"docker-stack: command failed with exit code {exc.returncode}: {_format_command(exc.cmd)}"]
     if output:
-        lines.append(output)
+        lines.append(_humanize_manager_error(output))
     suggestion = _manager_deploy_suggestion(output)
     if suggestion:
         lines.extend(["", suggestion])
@@ -1850,14 +1911,14 @@ def _format_called_process_error(exc: subprocess.CalledProcessError) -> str:
 
 def _format_runtime_error(exc: RuntimeError) -> str:
     message = str(exc).strip() or exc.__class__.__name__
-    lines = [f"docker-stack: {message}"]
+    lines = [f"docker-stack: {_humanize_manager_error(message)}"]
     suggestion = _manager_deploy_suggestion(message)
     if suggestion:
         lines.extend(["", suggestion])
     return "\n".join(lines)
 
 
-def main(args: List[str] = None):
+def _run(args: List[str] = None):
     parser = argparse.ArgumentParser(description="Deploy and manage Docker stacks.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2202,5 +2263,18 @@ def main(args: List[str] = None):
         sys.exit(2)
 
 
+def main(args: List[str] = None):
+    """Entry point. Ctrl+C has to look like an interrupted shell command, not a Python crash.
+
+    Commands that exec into another binary never reach this handler; it covers the paths that stay
+    in Python (cluster-rendered ``ps``, login, deploy) and any HTTP call they are blocked on.
+    """
+    try:
+        return _run(args)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
