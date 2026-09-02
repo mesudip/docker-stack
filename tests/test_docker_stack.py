@@ -429,7 +429,7 @@ class FakeManagerClient:
         self.deploy_payloads.append({"stack": stack, "namespace": namespace, "compose": compose, "options": options or {}})
         return {"warnings": [], "stdout": "", "stderr": ""}
 
-    def rollback_stack(self, *, stack, namespace, version):
+    def rollback_stack(self, *, stack, namespace, version, **_kwargs):
         self.rollback_payloads.append({"stack": stack, "namespace": namespace, "version": version})
         return {"warnings": [], "stdout": "", "stderr": ""}
 
@@ -1652,3 +1652,105 @@ def test_version_probe_failure_still_suggests_manager_url_check():
     formatted = _format_runtime_error(RuntimeError("Manager request failed (GET /version): connection refused"))
 
     assert "DOCKER_MANAGER_URL points at a reachable manager" in formatted
+
+
+def test_deployment_in_progress_error_names_the_active_run():
+    formatted = _format_runtime_error(
+        RuntimeError(
+            "Manager request failed (POST /api/stacks/web/rollback): HTTP 409: "
+            '{"code":"deployment_in_progress","message":"a deploy for this stack started by alice is still running",'
+            '"active_deployment":{"operation":"deploy","actor":"alice","deployment_id":"dep-1","started_at_ms":0}}'
+        )
+    )
+
+    assert "HTTP 409: a deploy started by alice" in formatted
+    assert "(deployment dep-1) is still running" in formatted
+    assert '{"code"' not in formatted
+    assert "abort it from the Docker-Manager stack page" in formatted
+    assert "DOCKER_MANAGER_DEPLOY_WAIT_SECS" in formatted
+
+
+def test_partial_failure_error_lists_failed_services():
+    formatted = _format_runtime_error(
+        RuntimeError(
+            "Manager request failed (POST /api/stacks/deploy): HTTP 502: "
+            '{"code":"deployment_partial_failure","message":"one or more services failed; all parallel service operations completed",'
+            '"services":[{"service":"api","action":"update","status":"failed","error":"image pull failed","incident_id":"abc123"},'
+            '{"service":"db","action":"unchanged","status":"succeeded","error":null}],"stdout":"","stderr":""}'
+        )
+    )
+
+    assert "HTTP 502: one or more services failed" in formatted
+    assert "  - api (update): image pull failed (incident abc123)" in formatted
+    assert "db" not in formatted
+    assert "rollback offered on the Docker-Manager stack page" in formatted
+
+
+def test_manager_deploy_event_printer_reports_waits_and_deployment_id(capsys):
+    from docker_stack.cli import DockerStack
+
+    DockerStack._print_manager_deploy_event({"event": "deployment", "data": {"deployment_id": "dep-9", "status": "running"}})
+    DockerStack._print_manager_deploy_event(
+        {
+            "event": "waiting",
+            "data": {"operation": "deploy", "actor": "alice", "started_at_ms": 0, "waited_secs": 0, "wait_budget_secs": 300},
+        }
+    )
+
+    captured = capsys.readouterr()
+    assert "[manager] deployment dep-9" in captured.out
+    assert "[manager] waiting: a deploy started by alice" in captured.err
+    assert "waiting up to 300s" in captured.err
+
+
+def test_deployment_in_progress_suggestion_mentions_double_enter():
+    formatted = _format_runtime_error(
+        RuntimeError(
+            "Manager request failed (POST /api/stacks/deploy/stream): HTTP 409: "
+            '{"code":"deployment_in_progress","message":"busy",'
+            '"active_deployment":{"operation":"deploy","actor":"alice","deployment_id":null,"started_at_ms":0}}'
+        )
+    )
+
+    assert "press Enter twice while waiting at a terminal" in formatted
+
+
+def test_manager_wait_printer_narrates_force_phases(capsys):
+    from docker_stack.cli import DockerStack
+
+    run = {"operation": "deploy", "actor": "alice", "deployment_id": "dep-1", "started_at_ms": 0}
+    for phase in ("forcing", "aborted", "aborted_other", "free", "not_released", "forbidden", "still_held", "force_used", "interrupted"):
+        DockerStack._print_manager_wait({**run, "phase": phase})
+
+    err = capsys.readouterr().err
+    assert "[manager] forcing: asking the manager to abort a deploy started by alice (deployment dep-1)" in err
+    assert "[manager] aborted a deploy started by alice (deployment dep-1); deploying now" in err
+    assert "[manager] aborted a different run than shown: a deploy started by alice (deployment dep-1); deploying now" in err
+    assert "[manager] the stack is free; deploying now" in err
+    assert "has not released the stack yet; waiting for it to finish" in err
+    assert "[manager] you do not have permission to abort a deploy started by alice" in err
+    assert "[manager] the stack is still held by a deploy started by alice" in err
+    assert "force was already used once in this run" in err
+    assert "that request may still complete" in err
+
+
+def test_manager_deploy_does_not_build_a_prompt_without_a_terminal(monkeypatch):
+    from docker_stack.cli import DockerStack
+
+    seen = {}
+
+    class RecordingManager(FakeManagerClient):
+        def deploy_stack_stream(self, *, stack, namespace, compose, options=None, on_event=None, wait_for_poll=None):
+            seen["wait_for_poll"] = wait_for_poll
+            return {"warnings": [], "stdout": "", "stderr": ""}
+
+    DockerStack._deploy_via_manager(
+        RecordingManager(),
+        stack_name="team-a",
+        namespace="default",
+        rendered_content="services: {}",
+        options={},
+    )
+
+    assert "wait_for_poll" in seen
+    assert seen["wait_for_poll"] is None  # pytest's stdin is not a terminal

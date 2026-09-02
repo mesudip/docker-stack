@@ -4,6 +4,8 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -215,6 +217,208 @@ def _manager_deploy_timeout_secs(default: int) -> int:
     )
 
 
+# How long a deploy/rollback waits for another run of the same stack to finish
+# before giving up. ``0`` fails immediately. Defaults to the deploy timeout.
+DEPLOY_WAIT_ENV = "DOCKER_MANAGER_DEPLOY_WAIT_SECS"
+DEPLOY_WAIT_POLL_SECS = 5
+DEPLOY_WAIT_NOTICE_SECS = 30
+# The manager's abort handler itself waits up to 30s for the holder to let go
+# of the stack, so the client must give it comfortably more than that.
+ABORT_REQUEST_TIMEOUT_SECS = 45
+
+
+def _manager_deploy_wait_secs(default: int) -> int:
+    raw = os.getenv(DEPLOY_WAIT_ENV, "").strip()
+    if not raw:
+        return _manager_deploy_timeout_secs(default)
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _manager_deploy_timeout_secs(default)
+
+
+class ManagerDeploymentInProgressError(RuntimeError):
+    """The manager refused an apply because another run holds this stack's deploy guard.
+
+    Docker-Manager answers interactive apply paths (``deploy/stream``, version
+    rollback) with ``409 deployment_in_progress`` instead of queueing. The
+    ``active_deployment`` payload names the run: ``operation``, ``actor``,
+    ``deployment_id``, ``started_at_ms``.
+    """
+
+    def __init__(self, message: str, *, active_deployment: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.active_deployment = active_deployment if isinstance(active_deployment, dict) else {}
+
+
+class ManagerAbortForbiddenError(RuntimeError):
+    """The caller may deploy this stack but lacks the permission to abort another run of it."""
+
+
+class ManagerNoActiveDeploymentError(RuntimeError):
+    """An abort found nothing running: the holder finished on its own."""
+
+
+class ManagerDeployFailedError(RuntimeError):
+    """A manager deploy stream ended with an ``error`` event.
+
+    ``services`` carries the per-service outcome when the manager reports a
+    partial failure (``code`` = ``deployment_partial_failure``); every parallel
+    service operation has completed by then, so this is the full picture.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        deployment_id: Optional[str] = None,
+        rollback_available: bool = False,
+        services: Optional[list] = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.deployment_id = deployment_id
+        self.rollback_available = rollback_available
+        self.services = services or []
+
+
+def describe_run(active: Any) -> str:
+    """Name a deploy run: who started what, when, and its deployment id if known."""
+    if not isinstance(active, dict):
+        return "another deployment of this stack"
+    operation = str(active.get("operation") or "deployment").strip() or "deployment"
+    actor = str(active.get("actor") or "").strip() or "another caller"
+    parts = [f"a {operation} started by {actor}"]
+    started_at_ms = active.get("started_at_ms")
+    if isinstance(started_at_ms, (int, float)) and started_at_ms > 0:
+        elapsed = max(0, int(time.time() - started_at_ms / 1000))
+        parts.append(f"{elapsed}s ago")
+    deployment_id = str(active.get("deployment_id") or "").strip()
+    if deployment_id:
+        parts.append(f"(deployment {deployment_id})")
+    return " ".join(parts)
+
+
+def describe_active_deployment(active: Any) -> str:
+    """One line naming the run that holds a stack: who, what, since when."""
+    return describe_run(active) + " is still running"
+
+
+def same_deploy_run(shown: Any, aborted: Any) -> bool:
+    """Whether the run the manager aborted is the one the user was looking at.
+
+    ``deployment_id`` is authoritative when both sides have one; it is ``null``
+    for a run that has not persisted its row yet and for non-stream deploys, so
+    fall back to who started what and when.
+    """
+    if not isinstance(shown, dict) or not isinstance(aborted, dict):
+        return True
+    shown_id = str(shown.get("deployment_id") or "").strip()
+    aborted_id = str(aborted.get("deployment_id") or "").strip()
+    if shown_id and aborted_id:
+        return shown_id == aborted_id
+    keys = ("operation", "actor", "started_at_ms")
+    return all(shown.get(key) == aborted.get(key) for key in keys)
+
+
+def format_failed_services(services: Any) -> list:
+    """Render the manager's per-service results as one line per failed service."""
+    lines = []
+    if not isinstance(services, list):
+        return lines
+    for item in services:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "").strip() not in {"failed", "error"}:
+            continue
+        service = str(item.get("service") or item.get("logical_name") or "service").strip()
+        action = str(item.get("action") or "").strip()
+        label = f"{service} ({action})" if action else service
+        error = str(item.get("error") or "").strip() or "failed without an error message"
+        incident = str(item.get("incident_id") or "").strip()
+        suffix = f" (incident {incident})" if incident else ""
+        lines.append(f"  - {label}: {error}{suffix}")
+    return lines
+
+
+def format_deploy_error_body(body: Dict[str, Any]) -> str:
+    """Expand a manager deploy error body into prose, keeping every reported cause."""
+    message = str(body.get("message") or "").strip()
+    code = str(body.get("code") or "").strip()
+    if code == "deployment_in_progress":
+        return describe_active_deployment(body.get("active_deployment")) if body.get("active_deployment") else message
+    lines = [message] if message else []
+    failed = format_failed_services(body.get("services"))
+    if failed:
+        lines.append("failed services:")
+        lines.extend(failed)
+    deployment_id = str(body.get("deployment_id") or "").strip()
+    if body.get("rollback_available") and deployment_id:
+        lines.append(f"rollback is available from the Docker-Manager stack page (deployment {deployment_id})")
+    elif deployment_id:
+        lines.append(f"deployment {deployment_id}")
+    return "\n".join(lines)
+
+
+def _wait_notifier(on_event):
+    """Surface deploy-guard waits through the same event callback as the stream."""
+    if on_event is None:
+        return None
+    return lambda active: on_event({"event": "waiting", "data": active})
+
+
+ABORT_DEPLOYMENT_PATH = "/api/stacks/deploy/abort"
+
+
+def _decode_http_error_body(exc: urllib.error.HTTPError) -> str:
+    try:
+        return exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _manager_http_error(method: str, path: str, exc: urllib.error.HTTPError) -> RuntimeError:
+    """Map an HTTP failure to the most specific error the caller can act on."""
+    payload = _decode_http_error_body(exc)
+    body: Any = None
+    if payload:
+        try:
+            body = json.loads(payload)
+        except json.JSONDecodeError:
+            body = None
+    if exc.code == 409 and isinstance(body, dict) and body.get("code") == "deployment_in_progress":
+        active = body.get("active_deployment")
+        return ManagerDeploymentInProgressError(
+            f"Manager request failed ({method} {path}): HTTP 409: {describe_active_deployment(active)}",
+            active_deployment=active if isinstance(active, dict) else {},
+        )
+    if exc.code == 404 and isinstance(body, dict) and body.get("code") == "no_active_deployment":
+        return ManagerNoActiveDeploymentError(f"Manager request failed ({method} {path}): HTTP 404: no deployment is running")
+    if exc.code == 403 and path == ABORT_DEPLOYMENT_PATH:
+        detail = str(body.get("message") or "").strip() if isinstance(body, dict) else ""
+        return ManagerAbortForbiddenError(
+            f"Manager request failed ({method} {path}): HTTP 403: {detail or 'stack deploy permission required'}"
+        )
+    suffix = f": {payload}" if payload else ""
+    return RuntimeError(f"Manager request failed ({method} {path}): HTTP {exc.code}{suffix}")
+
+
+def _stream_error(data: Any, default: str) -> ManagerDeployFailedError:
+    if not isinstance(data, dict):
+        message = str(data).strip() if data is not None else ""
+        return ManagerDeployFailedError(message or default)
+    message = format_deploy_error_body(data) or default
+    services = data.get("services")
+    return ManagerDeployFailedError(
+        message,
+        code=str(data.get("code") or "").strip() or None,
+        deployment_id=str(data.get("deployment_id") or "").strip() or None,
+        rollback_available=bool(data.get("rollback_available")),
+        services=services if isinstance(services, list) else [],
+    )
+
+
 def _manager_target_from_env() -> Optional[str]:
     manager_url = os.getenv("DOCKER_MANAGER_URL", "").strip()
     if manager_url:
@@ -293,14 +497,7 @@ class ManagerApiClient:
             with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            body = ""
-            try:
-                payload = exc.read().decode("utf-8", errors="replace").strip()
-                if payload:
-                    body = f": {payload}"
-            except Exception:
-                body = ""
-            raise RuntimeError(f"Manager request failed ({method} {path}): HTTP {exc.code}{body}") from exc
+            raise _manager_http_error(method, path, exc) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Manager request failed ({method} {path}): {exc.reason}") from exc
         except (TimeoutError, socket.timeout) as exc:
@@ -361,14 +558,7 @@ class ManagerApiClient:
                         event_data = {"raw": raw_data}
                     yield {"event": event_name, "data": event_data}
         except urllib.error.HTTPError as exc:
-            body = ""
-            try:
-                payload = exc.read().decode("utf-8", errors="replace").strip()
-                if payload:
-                    body = f": {payload}"
-            except Exception:
-                body = ""
-            raise RuntimeError(f"Manager request failed ({method} {path}): HTTP {exc.code}{body}") from exc
+            raise _manager_http_error(method, path, exc) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Manager request failed ({method} {path}): {exc.reason}") from exc
         except (TimeoutError, socket.timeout) as exc:
@@ -419,6 +609,128 @@ class ManagerApiClient:
     def is_manager_backend(self) -> bool:
         """True when the target is a Docker-Manager stack API rather than a raw daemon."""
         return self._detect_manager_backend()
+
+    def abort_active_deployment(self, *, stack: str, namespace: str) -> Optional[Dict[str, Any]]:
+        """Ask the manager to abort whatever holds this stack's deploy guard.
+
+        Returns the manager's ``{"aborted": <run>, "released": bool}`` payload, or
+        ``None`` when nothing was running any more. The manager waits up to 30s
+        for the holder to release before answering, hence the long timeout.
+        """
+        try:
+            payload = self._request_json(
+                ABORT_DEPLOYMENT_PATH,
+                method="POST",
+                payload={"namespace": namespace, "stack": stack},
+                timeout_secs=max(ABORT_REQUEST_TIMEOUT_SECS, int(self.timeout_secs or 0)),
+            )
+        except ManagerNoActiveDeploymentError:
+            return None
+        if not isinstance(payload, dict):
+            raise RuntimeError("Docker-Manager abort response is invalid")
+        return payload
+
+    def _force_takeover(self, *, stack: str, namespace: str, shown: Dict[str, Any], notify) -> str:
+        """Abort the run holding the stack so ours can go. Returns ``"retry"`` or ``"wait"``.
+
+        A daemon request the aborted run already made still completes; abort stops
+        its orchestration, and our deploy then applies over whatever state that left.
+        """
+        notify("forcing", shown)
+        try:
+            outcome = self.abort_active_deployment(stack=stack, namespace=namespace)
+        except ManagerAbortForbiddenError:
+            notify("forbidden", shown)
+            return "wait"
+        except ManagerDeploymentInProgressError as exc:
+            notify("still_held", exc.active_deployment or shown)
+            return "wait"
+        except KeyboardInterrupt:
+            notify("interrupted", shown)
+            raise
+        if outcome is None:
+            notify("free", shown)
+            return "retry"
+        aborted = outcome.get("aborted")
+        aborted = aborted if isinstance(aborted, dict) else shown
+        if not outcome.get("released"):
+            notify("not_released", aborted)
+            return "wait"
+        notify("aborted" if same_deploy_run(shown, aborted) else "aborted_other", aborted)
+        return "retry"
+
+    def _run_when_stack_is_free(
+        self,
+        operation,
+        *,
+        stack: Optional[str] = None,
+        namespace: Optional[str] = None,
+        on_wait=None,
+        wait_for_poll=None,
+    ):
+        """Run ``operation``, waiting out another deploy of the same stack.
+
+        The manager's interactive apply paths answer ``409 deployment_in_progress``
+        rather than queueing, because a person in the UI can choose to wait or
+        abort. Nobody is there to choose on a CLI or CI run, so queue here: retry
+        until the guard frees or ``DOCKER_MANAGER_DEPLOY_WAIT_SECS`` runs out,
+        and tell the caller what is being waited on. A budget of ``0`` fails
+        on the first collision.
+
+        ``wait_for_poll(active, seconds)`` replaces the sleep between polls for a
+        caller that can listen to a person; returning ``"force"`` aborts the
+        running deployment (once per run) so this one can take the stack.
+        ``on_wait`` receives the active run plus a ``phase`` for every notice.
+        """
+        budget = _manager_deploy_wait_secs(self.timeout_secs)
+        started = time.monotonic()
+        last_notice: Optional[float] = None
+        force_used = False
+        force_used_notified = False
+        skip_budget_check = False
+
+        def notify(phase: str, active: Any) -> None:
+            if on_wait:
+                base = active if isinstance(active, dict) else {}
+                on_wait({**base, "phase": phase})
+
+        while True:
+            try:
+                return operation()
+            except ManagerDeploymentInProgressError as exc:
+                waited = int(time.monotonic() - started)
+                if skip_budget_check:
+                    skip_budget_check = False
+                elif waited + DEPLOY_WAIT_POLL_SECS > budget:
+                    if budget > 0:
+                        raise ManagerDeploymentInProgressError(
+                            f"{exc}; gave up after waiting {waited}s "
+                            f"(raise {DEPLOY_WAIT_ENV} to wait longer, or abort it from the Docker-Manager stack page)",
+                            active_deployment=exc.active_deployment,
+                        ) from exc
+                    raise
+                now = time.monotonic()
+                if on_wait and (last_notice is None or now - last_notice >= DEPLOY_WAIT_NOTICE_SECS):
+                    on_wait(
+                        {**exc.active_deployment, "phase": "waiting", "waited_secs": waited, "wait_budget_secs": budget}
+                    )
+                    last_notice = now
+                if wait_for_poll is None:
+                    time.sleep(DEPLOY_WAIT_POLL_SECS)
+                    continue
+                decision = wait_for_poll(exc.active_deployment, DEPLOY_WAIT_POLL_SECS)
+                if decision != "force":
+                    continue
+                if force_used:
+                    if not force_used_notified:
+                        notify("force_used", exc.active_deployment)
+                        force_used_notified = True
+                    continue
+                force_used = True
+                if stack is None or namespace is None:
+                    raise RuntimeError("cannot force a deploy without knowing its stack and namespace")
+                if self._force_takeover(stack=stack, namespace=namespace, shown=exc.active_deployment, notify=notify) == "retry":
+                    skip_budget_check = True
 
     def check_node_agent(self, selector: str) -> Dict[str, Any]:
         """Report whether one node can serve node-local Docker commands.
@@ -649,6 +961,7 @@ class ManagerApiClient:
         images: Dict[str, str],
         options: Optional[Dict[str, Any]] = None,
         on_event=None,
+        wait_for_poll=None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "stack": stack,
@@ -659,23 +972,18 @@ class ManagerApiClient:
         if prepared_options:
             payload["options"] = prepared_options
 
-        done: Optional[Dict[str, Any]] = None
-        for event in self._request_sse_events(
-            "/api/stacks/deploy/images",
-            method="POST",
-            payload=payload,
-            timeout_secs=_manager_deploy_timeout_secs(self.timeout_secs),
-        ):
-            if on_event:
-                on_event(event)
-            event_name = event.get("event")
-            data = event.get("data")
-            if event_name == "error":
-                message = data.get("message") if isinstance(data, dict) else str(data)
-                raise RuntimeError(message or "manager image deploy stream failed")
-            if event_name == "done" and isinstance(data, dict):
-                done = data
-        return done or {"warnings": [], "stdout": "", "stderr": ""}
+        return self._run_when_stack_is_free(
+            lambda: self._consume_deploy_stream(
+                "/api/stacks/deploy/images",
+                payload,
+                on_event=on_event,
+                default_error="manager image deploy stream failed",
+            ),
+            stack=stack,
+            namespace=namespace,
+            on_wait=_wait_notifier(on_event),
+            wait_for_poll=wait_for_poll,
+        )
 
     def deploy_stack_stream(
         self,
@@ -685,15 +993,37 @@ class ManagerApiClient:
         compose: str,
         options: Optional[Dict[str, Any]] = None,
         on_event=None,
+        wait_for_poll=None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"stack": stack, "namespace": namespace, "compose": compose}
         prepared_options = _public_deploy_options(options, compose)
         if prepared_options:
             payload["options"] = prepared_options
 
+        return self._run_when_stack_is_free(
+            lambda: self._consume_deploy_stream(
+                "/api/stacks/deploy/stream",
+                payload,
+                on_event=on_event,
+                default_error="manager deploy stream failed",
+            ),
+            stack=stack,
+            namespace=namespace,
+            on_wait=_wait_notifier(on_event),
+            wait_for_poll=wait_for_poll,
+        )
+
+    def _consume_deploy_stream(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        on_event,
+        default_error: str,
+    ) -> Dict[str, Any]:
         done: Optional[Dict[str, Any]] = None
         for event in self._request_sse_events(
-            "/api/stacks/deploy/stream",
+            path,
             method="POST",
             payload=payload,
             timeout_secs=_manager_deploy_timeout_secs(self.timeout_secs),
@@ -703,19 +1033,32 @@ class ManagerApiClient:
             event_name = event.get("event")
             data = event.get("data")
             if event_name == "error":
-                message = data.get("message") if isinstance(data, dict) else str(data)
-                raise RuntimeError(message or "manager deploy stream failed")
+                raise _stream_error(data, default_error)
             if event_name == "done" and isinstance(data, dict):
                 done = data
         return done or {"warnings": [], "stdout": "", "stderr": ""}
 
-    def rollback_stack(self, *, stack: str, namespace: str, version: str) -> Dict[str, Any]:
+    def rollback_stack(
+        self,
+        *,
+        stack: str,
+        namespace: str,
+        version: str,
+        on_wait=None,
+        wait_for_poll=None,
+    ) -> Dict[str, Any]:
         quoted_stack = urllib.parse.quote(stack, safe="")
         if self._detect_manager_backend():
-            return self._request_json(
-                f"/api/stacks/{quoted_stack}/rollback",
-                method="POST",
-                payload={"namespace": namespace, "version": version},
+            return self._run_when_stack_is_free(
+                lambda: self._request_json(
+                    f"/api/stacks/{quoted_stack}/rollback",
+                    method="POST",
+                    payload={"namespace": namespace, "version": version},
+                ),
+                stack=stack,
+                namespace=namespace,
+                on_wait=on_wait,
+                wait_for_poll=wait_for_poll,
             )
         return self._request_json(
             self._endpoint_path(f"/inventory/stacks/{quoted_stack}/rollback"),

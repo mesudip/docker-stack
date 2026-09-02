@@ -187,6 +187,18 @@ are sent unchanged to the Docker CLI.
 -   **Docker Stack Versioning and Config Backup for Rollback:**
     The utility automatically versions your Docker configs and secrets, allowing for easy tracking of changes and seamless rollbacks to previous states. This provides a safety net for your deployments, ensuring you can always revert to a stable configuration.
 
+-   **Waiting for another deploy of the same stack (Docker-Manager):**
+    Docker-Manager runs one apply per stack at a time. When `docker-stack deploy` or `docker-stack checkout` finds another run in progress (a UI deploy, a CI image bump, another operator), it waits and prints who started it:
+
+    ```
+    [manager] waiting: a deploy started by alice 42s ago is still running (waiting up to 300s, set DOCKER_MANAGER_DEPLOY_WAIT_SECS to change)
+    [manager] press Enter twice to force your deploy (aborts that run; changes it already made to the daemon stay), Ctrl+C to quit
+    ```
+
+    - It retries every 5 seconds until the stack is free or `DOCKER_MANAGER_DEPLOY_WAIT_SECS` runs out (default: the deploy timeout; `0` fails immediately). CI runs wait the same way, without the prompt.
+    - At a terminal, pressing Enter twice within 3 seconds asks the manager to abort the running deployment and deploys as soon as the stack is released. This needs stack deploy permission and is offered once per run. The aborted run stops orchestrating, but daemon requests it already made still complete; your deploy then applies over that state.
+    - Ctrl+C exits without touching the other run.
+
 ## Why Use It?
 
 Vanilla Docker Stack deployments can sometimes lack the flexibility needed for dynamic environments or robust secret management. This utility bridges those gaps by:

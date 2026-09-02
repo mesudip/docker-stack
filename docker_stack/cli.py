@@ -36,11 +36,16 @@ from docker_stack.shell_auth import (
     run_managed_shell,
     shell_session_active,
 )
+from docker_stack.conflict_prompt import ForceDeployPrompt
 from docker_stack.manager_api import (
+    DEPLOY_WAIT_ENV,
     FEATURE_STACK_DEPLOY,
     FEATURE_STACK_QUERY,
     ManagerApiClient,
+    describe_active_deployment,
+    describe_run,
     discover_manager_client,
+    format_deploy_error_body,
 )
 from docker_stack.registry import DockerRegistry
 from .envsubst import LineCheckResult, SubstitutionError, envsubst, envsubst_load_file
@@ -1500,6 +1505,7 @@ class DockerStack:
                 options=options,
             )
         else:
+            prompt = ForceDeployPrompt.create()
             try:
                 payload = manager_client.deploy_stack_stream(
                     stack=stack_name,
@@ -1507,6 +1513,7 @@ class DockerStack:
                     compose=rendered_content,
                     options=options,
                     on_event=DockerStack._print_manager_deploy_event,
+                    wait_for_poll=prompt.wait if prompt else None,
                 )
             except RuntimeError as exc:
                 message = str(exc)
@@ -1571,6 +1578,51 @@ class DockerStack:
             message = data.get("message") or data.get("error") or ""
             if message:
                 print(f"[manager] {service}: {status}: {message}", flush=True)
+        elif event_name == "deployment":
+            deployment_id = data.get("deployment_id")
+            if deployment_id:
+                mode = data.get("mode") or "deployment"
+                print(f"[manager] {mode} {deployment_id}", flush=True)
+        elif event_name == "waiting":
+            DockerStack._print_manager_wait(data)
+
+    @staticmethod
+    def _print_manager_wait(active: Dict[str, object]) -> None:
+        """Narrate the wait for another run of this stack, and any attempt to force past it.
+
+        The manager will not queue an interactive deploy for us, so the CLI polls
+        and reports each phase: waiting, forcing (asking the manager to abort the
+        holder), and how that abort ended.
+        """
+        if not isinstance(active, dict):
+            active = {}
+        phase = str(active.get("phase") or "waiting")
+        run = describe_run(active)
+        if phase == "waiting":
+            budget = active.get("wait_budget_secs")
+            suffix = f" (waiting up to {budget}s, set {DEPLOY_WAIT_ENV} to change)" if isinstance(budget, int) else ""
+            message = f"waiting: {describe_active_deployment(active)}{suffix}"
+        elif phase == "forcing":
+            message = f"forcing: asking the manager to abort {run}"
+        elif phase == "aborted":
+            message = f"aborted {run}; deploying now"
+        elif phase == "aborted_other":
+            message = f"aborted a different run than shown: {run}; deploying now"
+        elif phase == "free":
+            message = "the stack is free; deploying now"
+        elif phase == "not_released":
+            message = f"asked the manager to abort {run}, but it has not released the stack yet; waiting for it to finish"
+        elif phase == "forbidden":
+            message = f"you do not have permission to abort {run}; still waiting"
+        elif phase == "still_held":
+            message = f"the stack is still held by {run}; waiting"
+        elif phase == "force_used":
+            message = "force was already used once in this run; waiting for the stack to free up"
+        elif phase == "interrupted":
+            message = "interrupted while asking the manager to abort; that request may still complete"
+        else:
+            message = f"{phase}: {run}"
+        print(f"[manager] {message}", file=sys.stderr, flush=True)
 
     @staticmethod
     def _rollback_via_manager(
@@ -1580,10 +1632,13 @@ class DockerStack:
         namespace: str,
         version: str,
     ) -> Optional[str]:
+        prompt = ForceDeployPrompt.create()
         payload = manager_client.rollback_stack(
             stack=stack_name,
             namespace=namespace,
             version=version,
+            on_wait=DockerStack._print_manager_wait,
+            wait_for_poll=prompt.wait if prompt else None,
         )
         warnings = payload.get("warnings") or []
         for warning in warnings:
@@ -1868,7 +1923,7 @@ def _humanize_manager_error(message: str) -> str:
         return message
     if not isinstance(body, dict):
         return message
-    detail = str(body.get("message", "")).strip()
+    detail = format_deploy_error_body(body) if body.get("code") else str(body.get("message", "")).strip()
     if not detail:
         return message
     incident = str(body.get("incident_id") or body.get("trace_id") or "").strip()
@@ -1896,6 +1951,17 @@ def _manager_deploy_suggestion(message: str) -> Optional[str]:
             "by this stack. Either allow that external network in the Docker-Manager deployment rule, attach the service to "
             "a stack-owned network, or relabel/recreate the existing network with the expected stack ownership before deploying."
         )
+    if "is still running" in lowered and ("gave up after waiting" in lowered or "http 409" in lowered):
+        return (
+            "Suggestion: another run holds this stack's deploy lock. Rerun and let it wait, raise "
+            f"{DEPLOY_WAIT_ENV} to queue longer, press Enter twice while waiting at a terminal to abort that run "
+            "and force your deploy, or abort it from the Docker-Manager stack page."
+        )
+    if "failed services:" in lowered:
+        return (
+            "Suggestion: every service operation has finished; the failed ones are listed above with their incident ids. "
+            "Fix the cause and redeploy, or use the rollback offered on the Docker-Manager stack page to restore the previous specs."
+        )
     if "stack not found" in lowered:
         return (
             "Suggestion: the manager was reached but has no stack by that name in that namespace. "
@@ -1918,9 +1984,10 @@ def _manager_deploy_suggestion(message: str) -> Optional[str]:
 def _format_called_process_error(exc: subprocess.CalledProcessError) -> str:
     output = _error_output(exc)
     lines = [f"docker-stack: command failed with exit code {exc.returncode}: {_format_command(exc.cmd)}"]
-    if output:
-        lines.append(_humanize_manager_error(output))
-    suggestion = _manager_deploy_suggestion(output)
+    humanized = _humanize_manager_error(output) if output else ""
+    if humanized:
+        lines.append(humanized)
+    suggestion = _manager_deploy_suggestion(humanized or output)
     if suggestion:
         lines.extend(["", suggestion])
     return "\n".join(lines)
@@ -1928,8 +1995,9 @@ def _format_called_process_error(exc: subprocess.CalledProcessError) -> str:
 
 def _format_runtime_error(exc: RuntimeError) -> str:
     message = str(exc).strip() or exc.__class__.__name__
-    lines = [f"docker-stack: {_humanize_manager_error(message)}"]
-    suggestion = _manager_deploy_suggestion(message)
+    humanized = _humanize_manager_error(message)
+    lines = [f"docker-stack: {humanized}"]
+    suggestion = _manager_deploy_suggestion(humanized)
     if suggestion:
         lines.extend(["", suggestion])
     return "\n".join(lines)

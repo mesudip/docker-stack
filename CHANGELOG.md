@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased
+## v2.3.0
 
 ### Fixed
+
+- Manager-backed `deploy` and `rollback` no longer fail with a raw `HTTP 409` when another deploy of the same stack is running. Docker-Manager now serializes applies per stack and answers the interactive stream and rollback paths with `409 deployment_in_progress` instead of racing; `docker-stack` queues behind that run, prints who started it, and retries until it finishes or `DOCKER_MANAGER_DEPLOY_WAIT_SECS` runs out (default: the deploy timeout, `0` fails immediately). The GitHub Action image-only deploy does the same.
+- Manager deploy failures now list every failed service with its error and incident id. Docker-Manager runs service operations in parallel and reports `deployment_partial_failure` with per-service results; the CLI used to print only the generic summary line and drop the causes. When the manager offers a rollback it prints the deployment id to use on the stack page.
+- The manager's `deployment` stream event is printed, so a CLI deploy can be matched to its entry in the Docker-Manager deployment history.
+
+### Added
+
+- While `deploy` or `checkout` waits for another run of the same stack, pressing Enter twice at a terminal forces the deploy: the CLI asks Docker-Manager to abort the running deployment (`POST /api/stacks/deploy/abort`) and deploys as soon as the stack is released. Force is offered once per run, needs stack deploy permission, and every outcome (aborted, already finished, not released, no permission) is reported. Nothing changes for non-interactive runs, which keep waiting.
 
 - `docker-stack node use <node>` no longer fails with "Docker-Manager does not support cluster container CLI". Node selection now checks only the node being selected: an unrelated node that is drained, down, or missing its agent can no longer make a usable node - including the manager's own - look unusable. The failure that is reported is the concrete reason that specific node is unreachable.
 - Endpoint discovery no longer swallows its cause. When a command must report a failure, it says whether no Docker-Manager endpoint could be resolved, or the endpoint is not a Docker-Manager, instead of blaming the manager version.

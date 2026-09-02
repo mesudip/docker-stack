@@ -119,7 +119,7 @@ runs:
           python3 - <<'PY'
         import os
         import sys
-        from docker_stack.manager_api import discover_manager_client
+        from docker_stack.manager_api import describe_active_deployment, discover_manager_client
 
         def print_manager_event(event):
             event_name = event.get("event")
@@ -151,6 +151,12 @@ runs:
                 message = data.get("message") or data.get("error") or ""
                 if message:
                     print(f"[manager] {service}: {status}: {message}", flush=True)
+            elif event_name == "deployment":
+                deployment_id = data.get("deployment_id")
+                if deployment_id:
+                    print(f"[manager] deployment {deployment_id}", flush=True)
+            elif event_name == "waiting":
+                print(f"[manager] waiting: {describe_active_deployment(data)}", file=sys.stderr, flush=True)
 
         overrides = {}
         for raw in os.environ.get("DOCKER_STACK_ACTION_IMAGES", "").splitlines():
@@ -180,13 +186,16 @@ runs:
             options["resolve_image"] = resolve_image
         if os.environ.get("DOCKER_STACK_ACTION_FORCE_UPDATE", "").lower() == "true":
             options["force_update"] = True
-        payload = client.deploy_stack_images(
-            stack=os.environ["DOCKER_STACK_ACTION_STACK"],
-            namespace=os.environ["DOCKER_STACK_ACTION_NAMESPACE"],
-            images=overrides,
-            options=options,
-            on_event=print_manager_event,
-        )
+        try:
+            payload = client.deploy_stack_images(
+                stack=os.environ["DOCKER_STACK_ACTION_STACK"],
+                namespace=os.environ["DOCKER_STACK_ACTION_NAMESPACE"],
+                images=overrides,
+                options=options,
+                on_event=print_manager_event,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(f"docker-stack: {exc}")
         for warning in payload.get("warnings") or []:
             print(f"[manager] {warning}")
         PY
