@@ -25,9 +25,8 @@ def generate_secret(
         A randomly generated secret string.
 
     Note:
-        Values are drawn from the ``secrets`` module (a CSPRNG), not
-        ``random``, because these strings are used as passwords, API keys and
-        bearer tokens.
+        Uses the ``secrets`` module rather than ``random``, since these values
+        are used as passwords, API keys and tokens.
     """
     if length is None:
         length = 12 + _secrets.randbelow(9)  # 12..20 inclusive

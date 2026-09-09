@@ -277,13 +277,12 @@ secrets:
       uppercase: true  # A-Z                     (default true)
 ```
 
-Lowercase letters are always included, and the first character is always a
-letter. Values are drawn from Python's `secrets` module (a CSPRNG).
+Lowercase letters are always included and the value always starts with a
+letter.
 
-`special: true` uses `string.punctuation` minus `$`, `'`, `"`, and `\`, so
-generated values are safe to paste into shells and YAML. Set `special: false`
-when the consuming application rejects punctuation, or for values that travel
-in HTTP headers or URLs:
+`special: true` leaves out `$`, `'`, `"` and `\`, so generated values are safe
+to paste into a shell or a YAML file. Use `special: false` when the application
+rejects punctuation, or for values that go in URLs or HTTP headers:
 
 ```yaml
 secrets:
@@ -295,34 +294,15 @@ secrets:
       uppercase: true
 ```
 
-## Object Versioning and Reuse
+## Versioning and Reuse
 
-This section describes exactly when `docker-stack` creates a new Docker object
-and when it reuses an existing one. Getting this wrong is the most common
-source of surprise, so the rules are stated in full.
+Docker configs and secrets cannot be changed in place. `docker-stack` handles
+that for you: when a config's content changes, it creates a new version and
+points your services at it. You never have to add `_v2` to names yourself.
 
-Every object `docker-stack` creates carries these labels:
-
-- `mesudip.object.name` — the logical name from the compose file
-- `mesudip.object.version` — an integer, starting at 1
-- `sha256` — a hash of the content
-- `mesudip.secret.generated=true` — generated secrets only
-
-On each deploy, for every config and secret:
-
-1. Existing versions are looked up by `mesudip.object.name`.
-2. **Generated secrets short-circuit here.** If the newest existing version has
-   `mesudip.secret.generated=true` and the compose file still says
-   `x-generate`, that secret is reused unchanged and the deploy is a no-op for
-   it. Its content is never compared, because a freshly generated value would
-   never match.
-3. Otherwise the content hash is compared against every existing version. On a
-   match, that version is reused.
-4. On no match, a new object is created as `<name>_v<N+1>`.
-
-Docker objects are immutable, so "updating" a config always means creating a
-new version and pointing services at it. `docker-stack` does that for you; you
-do not need to version names by hand in the compose file.
+**Generated secrets are created once.** Redeploying does not change them, so
+anything holding a generated value keeps working. The value survives
+redeploys, restarts and unrelated changes to the stack.
 
 ### Stored source metadata
 
@@ -335,36 +315,28 @@ environment values, and any config files referenced by `configs.*.file` or
 Secret source files, and the variables named by `secrets.*.environment`, are
 deliberately **not** stored in `x-files`.
 
-### Generation happens once, not on every deploy
-
-Because of rule 2, `x-generate` is idempotent. A generated secret keeps its
-value across redeploys, restarts, and unrelated changes to the stack. Clients
-holding the value do not need updating when you redeploy.
-
 ### Rotating a generated secret
 
-There is no `--rotate` flag. Rule 2 matches on the `mesudip.secret.generated`
-label, so rotation means preventing that match:
+There is no rotate flag. Remove the secret's newest version, then deploy again
+to get a fresh value:
 
 ```bash
-docker service update --secret-rm <old> --secret-add <new> <service>   # or:
-docker secret rm <name>_v<N>        # remove the newest generated version
-docker-stack deploy my-stack docker-compose.yml   # generates a fresh value
+docker secret rm <name>_v<N>
+docker-stack deploy --show-generated my-stack docker-compose.yml
 ```
 
-Then update every client that holds the old value. Use `--show-generated` to
-print newly generated values after the deploy.
+`--show-generated` prints the new value. Update anything still holding the old
+one.
 
-### Adopting a secret that already exists
+### Secrets you created yourself
 
-A secret created outside `docker-stack` (for example with `docker secret
-create`) has no `mesudip.*` labels. Pointing `x-generate` at that name does
-**not** adopt it: rule 2 cannot match an unlabelled object, so the deploy
-generates a new value and every client holding the old one breaks.
+If a secret already exists because you ran `docker secret create`, pointing
+`x-generate` at it does **not** take it over. The deploy generates a new value
+instead, and anything holding the old one stops working.
 
-Migrate deliberately. Either keep the secret as `external: true`, or switch to
-`x-generate`, deploy with `--show-generated`, and update all clients once.
-After that first deploy the secret is labelled and stable.
+Either leave it as `external: true`, or move to `x-generate` deliberately:
+deploy once with `--show-generated`, then update your clients. After that it
+behaves like any other generated secret.
 
 ## Known Limitations
 
