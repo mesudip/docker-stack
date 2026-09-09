@@ -173,197 +173,198 @@ and therefore do not add the `NODE` column. Explicit Docker overrides such as
 `--context`, `--host`/`-H`, and `--config` bypass managed cluster formatting and
 are sent unchanged to the Docker CLI.
 
-## Core Capabilities
+## What It Adds
 
--   **Advanced Deployments on Plain Docker Daemons:**
-    `docker-stack` works directly against a raw Docker daemon and adds capabilities that standard `docker stack deploy` does not provide out of the box:
-    - generated secrets
-    - inline configs and secrets
-    - template rendering from environment variables and files
-    - versioned config and secret history
-    - version lookup, checkout, and rollback-oriented workflows
-    - more ergonomic stack and node inspection output
+Beyond `docker stack deploy`, against a plain Docker daemon:
 
--   **Docker Stack Versioning and Config Backup for Rollback:**
-    The utility automatically versions your Docker configs and secrets, allowing for easy tracking of changes and seamless rollbacks to previous states. This provides a safety net for your deployments, ensuring you can always revert to a stable configuration.
+- **Generated secrets** — no external scripts; see [Object Versioning and Reuse](#object-versioning-and-reuse) for the once-only semantics.
+- **Inline and templated configs/secrets** — content in the compose file, or expanded from environment variables and files.
+- **Automatic versioning** — configs and secrets are content-hashed and versioned, so edits do not require hand-written `_v2` names.
+- **Version inspection and checkout** — `versions`, `cat`, and `checkout` restore a complete recorded stack version, including its configs.
+- **Cluster-aware inspection** — stack and node output that reports the owning Swarm node.
 
--   **Waiting for another deploy of the same stack (Docker-Manager):**
-    Docker-Manager runs one apply per stack at a time. When `docker-stack deploy` or `docker-stack checkout` finds another run in progress (a UI deploy, a CI image bump, another operator), it waits and prints who started it:
+### Concurrent deploys (Docker-Manager)
 
-    ```
-    [manager] waiting: a deploy started by alice 42s ago is still running (waiting up to 300s, set DOCKER_MANAGER_DEPLOY_WAIT_SECS to change)
-    [manager] press Enter twice to force your deploy (aborts that run; changes it already made to the daemon stay), Ctrl+C to quit
-    ```
+Docker-Manager runs one apply per stack at a time. When `docker-stack deploy`
+or `docker-stack checkout` finds another run in progress (a UI deploy, a CI
+image bump, another operator), it waits and prints who started it:
 
-    - It retries every 5 seconds until the stack is free or `DOCKER_MANAGER_DEPLOY_WAIT_SECS` runs out (default: the deploy timeout; `0` fails immediately). CI runs wait the same way, without the prompt.
-    - At a terminal, pressing Enter twice within 3 seconds asks the manager to abort the running deployment and deploys as soon as the stack is released. This needs stack deploy permission and is offered once per run. The aborted run stops orchestrating, but daemon requests it already made still complete; your deploy then applies over that state.
-    - Ctrl+C exits without touching the other run.
+```
+[manager] waiting: a deploy started by alice 42s ago is still running (waiting up to 300s, set DOCKER_MANAGER_DEPLOY_WAIT_SECS to change)
+[manager] press Enter twice to force your deploy (aborts that run; changes it already made to the daemon stay), Ctrl+C to quit
+```
 
-## Why Use It?
+- It retries every 5 seconds until the stack is free or `DOCKER_MANAGER_DEPLOY_WAIT_SECS` runs out (default: the deploy timeout; `0` fails immediately). CI runs wait the same way, without the prompt.
+- At a terminal, pressing Enter twice within 3 seconds asks the manager to abort the running deployment and deploys as soon as the stack is released. This needs stack deploy permission and is offered once per run. The aborted run stops orchestrating, but daemon requests it already made still complete; your deploy then applies over that state.
+- Ctrl+C exits without touching the other run.
 
-Vanilla Docker Stack deployments can sometimes lack the flexibility needed for dynamic environments or robust secret management. This utility bridges those gaps by:
+## Compose Extensions
 
--   **Automating Secret Management:** No more manual secret generation or complex external scripts.
--   **Simplifying Configuration:** Define configs and secrets directly in your compose files or use templates.
--   **Enhancing Security:** Generate strong, random secrets on the fly.
--   **Enabling Rollbacks:** Versioning ensures you can always revert to a known good state.
--   **Improving Raw Daemon Workflows:** Works directly with a plain Docker Swarm daemon.
+`docker-stack` reads extra keys under top-level `configs:` and `secrets:` and
+resolves them into real Docker objects before calling `docker stack deploy`.
+Standard Compose keys (`file:`, `external:`, `name:`) continue to work.
 
-## Advanced Compose Features
+| Key | Configs | Secrets | Content comes from |
+| --- | --- | --- | --- |
+| `file:` | yes | yes | the file, verbatim (standard Compose) |
+| `x-content` | yes | yes | a literal string in the compose file |
+| `x-template` | yes | yes | a literal string, with `${VAR}` expanded |
+| `x-template-file` | yes | yes | a file, with `${VAR}` expanded |
+| `environment` | no | yes | the named environment variable |
+| `x-generate` | no | yes | a value generated by `docker-stack` |
 
--   **Docker Config and Secret Management with Extended Options:**
-    This utility significantly extends Docker's native config and secret management by introducing `x-` prefixed directives in your `docker-compose.yml` files. These directives allow for dynamic content generation, templating, and file inclusion, making your deployments more flexible and secure.
+Exactly one content key per object.
 
-    ### `x-content`: Inline Content for Configs and Secrets
-    Allows you to define the content of a Docker config or secret directly within your `docker-compose.yml`.
+### `x-content` — inline content
 
-    ```yaml
-    secrets:
-      my_inline_secret:
-        x-content: "This is my secret content defined inline."
+```yaml
+secrets:
+  my_inline_secret:
+    x-content: "This is my secret content defined inline."
 
-    configs:
-      my_inline_config:
-        x-content: |
-          key=value
-          another_key=another_value
-    ```
+configs:
+  my_inline_config:
+    x-content: |
+      key=value
+      another_key=another_value
+```
 
-    ### `x-template`: Environment Variable Templating
-    Enables the use of environment variables within your config or secret content, which are substituted at deployment time.
+### `x-template` and `x-template-file` — environment substitution
 
-    ```yaml
-    secrets:
-      my_templated_secret:
-        x-template: "I can create composite secret with template. ${API_KEY_NAME}:${MY_API_KEY}"
-    ```
+`${VAR}` references are expanded from the deploying shell's environment.
 
-    ### `x-template-file`: External Template Files
-    Reference an external file whose content will be treated as a template and processed with environment variables.
+```yaml
+secrets:
+  my_templated_secret:
+    x-template: "${API_KEY_NAME}:${MY_API_KEY}"
 
-    ```yaml
-    configs:
-      my_config_from_template_file:
-        x-template-file: "./templates/my_config.tpl"
-    ```
-    *(Content of `./templates/my_config.tpl` might be: `DB_HOST=${DATABASE_HOST}`)*
+configs:
+  my_config_from_template_file:
+    x-template-file: "./templates/my_config.tpl"
+```
 
-    ### `environment`: Secret Content from Environment Variables
-    Secrets can read their content from an environment variable at deploy time.
+### `environment` — secret content from a variable
 
-    ```yaml
-    secrets:
-      api_token:
-        environment: API_TOKEN
-    ```
+```yaml
+secrets:
+  api_token:
+    environment: API_TOKEN
+```
 
-    If the variable is unset or empty, deployment fails before Docker objects are created.
+If the variable is unset or empty, the deploy fails before any Docker object is
+created.
 
-    ### Stored Source Metadata
-    Versioned stack configs include a top-level `x-files` list with base64-encoded source material for recovery and auditing. This includes the original compose file as `compose.yml`, a generated `.env` containing referenced non-secret environment values, and config files referenced by `configs.*.file` or `configs.*.x-template-file`. Secret source files and variables used by `secrets.*.environment` are not stored in `x-files`.
+### `x-generate` — generated secrets
 
-    ### `x-generate`: Dynamic Secret Generation (Secrets Only)
-    This powerful feature allows you to automatically generate random secrets based on specified criteria, eliminating the need to manually create and manage them. This is particularly useful for passwords, API keys, and other sensitive data.
+Secrets only. Configs must use `x-content`, `x-template`, or `x-template-file`.
 
-    Supported `x-generate` forms:
+```yaml
+secrets:
+  # default options, random length 12-20
+  simple:
+    x-generate: true
 
-    -   `true`
-        Generate a secret with default options.
-    -   integer
-        Generate a secret with the requested length.
-    -   object
-        Generate a secret with explicit generation flags.
+  # fixed length, default character classes
+  fixed_length:
+    x-generate: 30
 
-    Supported object flags:
+  # explicit character classes
+  api_token:
+    x-generate:
+      length: 40
+      numbers: true    # digits 0-9              (default true)
+      special: true    # punctuation             (default true)
+      uppercase: true  # A-Z                     (default true)
+```
 
-    -   `length`
-        Exact secret length.
-    -   `numbers`
-        Include digits `0-9`.
-    -   `special`
-        Include special characters.
-    -   `uppercase`
-        Include uppercase letters `A-Z`.
+Lowercase letters are always included, and the first character is always a
+letter. Values are drawn from Python's `secrets` module (a CSPRNG).
 
-    Behavior notes:
+`special: true` uses `string.punctuation` minus `$`, `'`, `"`, and `\`, so
+generated values are safe to paste into shells and YAML. Set `special: false`
+when the consuming application rejects punctuation, or for values that travel
+in HTTP headers or URLs:
 
-    -   Generated values are created at deploy time.
-    -   Generated secrets are versioned like other managed secrets.
-    -   Newly generated values can be shown after deploy when `--show-generated` is enabled.
-    -   `x-generate` is for secrets only; configs should use `x-content`, `x-template`, or `x-template-file`.
+```yaml
+secrets:
+  bearer_token:
+    x-generate:
+      length: 64
+      numbers: true
+      special: false
+      uppercase: true
+```
 
-    -   **Simple Generation (12-20 characters, default options):**
-        ```yaml
-        secrets:
-          my_simple_generated_secret:
-            x-generate: true
-        ```
+## Object Versioning and Reuse
 
-    -   **Specify Length:**
-        ```yaml
-        secrets:
-          my_fixed_length_secret:
-            x-generate: 30 # Generates a 30-character secret
-        ```
+This section describes exactly when `docker-stack` creates a new Docker object
+and when it reuses an existing one. Getting this wrong is the most common
+source of surprise, so the rules are stated in full.
 
-    -   **Custom Generation Options:**
-        You can provide a dictionary to fine-tune the generation process:
-        -   `length`: (integer, default: 12-20 random) Exact length of the secret.
-        -   `numbers`: (boolean, default: `true`) Include numbers (0-9).
-        -   `special`: (boolean, default: `true`) Include special characters (!@#$%^&*...).
-        -   `uppercase`: (boolean, default: `true`) Include uppercase letters (A-Z).
+Every object `docker-stack` creates carries these labels:
 
-        ```yaml
-        secrets:
-          my_complex_generated_secret:
-            x-generate:
-              length: 25
-              numbers: false
-              special: true
-              uppercase: true
-          my_alphanumeric_secret:
-            x-generate:
-              length: 15
-              numbers: true
-              special: false
-              uppercase: false
-        ```
+- `mesudip.object.name` — the logical name from the compose file
+- `mesudip.object.version` — an integer, starting at 1
+- `sha256` — a hash of the content
+- `mesudip.secret.generated=true` — generated secrets only
 
-    -   **Database Password Style Secret:**
-        Generates a strong password with uppercase letters, lowercase letters, numbers, and special characters.
-        ```yaml
-        secrets:
-          db_password:
-            x-generate:
-              length: 32
-              numbers: true
-              special: false
-              uppercase: true
-        ```
+On each deploy, for every config and secret:
 
-    -   **Application Token Without Special Characters:**
-        Useful when the target application rejects punctuation in credentials or tokens.
-        ```yaml
-        secrets:
-          app_token:
-            x-generate:
-              length: 40
-              numbers: true
-              special: false
-              uppercase: true
-        ```
+1. Existing versions are looked up by `mesudip.object.name`.
+2. **Generated secrets short-circuit here.** If the newest existing version has
+   `mesudip.secret.generated=true` and the compose file still says
+   `x-generate`, that secret is reused unchanged and the deploy is a no-op for
+   it. Its content is never compared, because a freshly generated value would
+   never match.
+3. Otherwise the content hash is compared against every existing version. On a
+   match, that version is reused.
+4. On no match, a new object is created as `<name>_v<N+1>`.
 
-    -   **Lowercase Alphanumeric Secret:**
-        Useful for systems that want URL-safe or copy-friendly generated values.
-        ```yaml
-        secrets:
-          compact_secret:
-            x-generate:
-              length: 24
-              numbers: true
-              special: false
-              uppercase: false
-        ```
+Docker objects are immutable, so "updating" a config always means creating a
+new version and pointing services at it. `docker-stack` does that for you; you
+do not need to version names by hand in the compose file.
+
+### Stored source metadata
+
+Versioned stack configs include a top-level `x-files` list holding
+base64-encoded source material for recovery and auditing: the original compose
+file as `compose.yml`, a generated `.env` containing referenced non-secret
+environment values, and any config files referenced by `configs.*.file` or
+`configs.*.x-template-file`.
+
+Secret source files, and the variables named by `secrets.*.environment`, are
+deliberately **not** stored in `x-files`.
+
+### Generation happens once, not on every deploy
+
+Because of rule 2, `x-generate` is idempotent. A generated secret keeps its
+value across redeploys, restarts, and unrelated changes to the stack. Clients
+holding the value do not need updating when you redeploy.
+
+### Rotating a generated secret
+
+There is no `--rotate` flag. Rule 2 matches on the `mesudip.secret.generated`
+label, so rotation means preventing that match:
+
+```bash
+docker service update --secret-rm <old> --secret-add <new> <service>   # or:
+docker secret rm <name>_v<N>        # remove the newest generated version
+docker-stack deploy my-stack docker-compose.yml   # generates a fresh value
+```
+
+Then update every client that holds the old value. Use `--show-generated` to
+print newly generated values after the deploy.
+
+### Adopting a secret that already exists
+
+A secret created outside `docker-stack` (for example with `docker secret
+create`) has no `mesudip.*` labels. Pointing `x-generate` at that name does
+**not** adopt it: rule 2 cannot match an unlabelled object, so the deploy
+generates a new value and every client holding the old one breaks.
+
+Migrate deliberately. Either keep the secret as `external: true`, or switch to
+`x-generate`, deploy with `--show-generated`, and update all clients once.
+After that first deploy the secret is labelled and stable.
 
 ## Known Limitations
 

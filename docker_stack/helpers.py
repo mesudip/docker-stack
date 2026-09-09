@@ -1,4 +1,4 @@
-import random
+import secrets as _secrets
 import string
 import sys
 from typing import Callable, Dict, List, Optional, Union
@@ -23,13 +23,18 @@ def generate_secret(
 
     Returns:
         A randomly generated secret string.
+
+    Note:
+        Values are drawn from the ``secrets`` module (a CSPRNG), not
+        ``random``, because these strings are used as passwords, API keys and
+        bearer tokens.
     """
     if length is None:
-        length = random.randint(12, 20)
+        length = 12 + _secrets.randbelow(9)  # 12..20 inclusive
 
     # Always start with a letter (uppercase or lowercase)
     first_char_pool = string.ascii_lowercase + string.ascii_uppercase
-    first_char = random.choice(first_char_pool)
+    first_char = _secrets.choice(first_char_pool)
 
     # Prepare the character pool for the rest of the secret
     characters = string.ascii_lowercase
@@ -47,7 +52,7 @@ def generate_secret(
         raise ValueError("No character types selected for secret generation.")
 
     # Generate the rest of the string
-    secret = [first_char] + [random.choice(characters) for _ in range(length - 1)]
+    secret = [first_char] + [_secrets.choice(characters) for _ in range(length - 1)]
 
     return "".join(secret)
 

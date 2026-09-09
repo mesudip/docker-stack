@@ -2099,14 +2099,14 @@ def _run(args: List[str] = None):
 
     checkout_parser = subparsers.add_parser("checkout", help="Deploy specific version of the stack")
     checkout_parser.add_argument("stack_name", help="Name of the stack")
-    checkout_parser.add_argument("version", help="Stack version to cat")
+    checkout_parser.add_argument("version", help="Stack version to deploy")
     _add_namespace_argument(checkout_parser)
 
     # version_parser = subparsers.add_parser("version",help="Deploy specific version of the stack")
     # version_parser.add_argument("stack_name", help="Name of the stack")
     # version_parser.add_argument("version","versions", help="Stack version to cat")
 
-    version_parser = subparsers.add_parser("version", aliases=["versions"], help="Deploy specific version of the stack")
+    version_parser = subparsers.add_parser("version", aliases=["versions"], help="List recorded versions of the stack")
     version_parser.add_argument("stack_name", help="Name of the stack")
     _add_namespace_argument(version_parser)
 
