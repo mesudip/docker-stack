@@ -243,16 +243,24 @@ configs:
     x-template-file: "./templates/my_config.tpl"
 ```
 
-### `environment` — secret content from a variable
+### `environment` — content from a variable
 
 ```yaml
 secrets:
   api_token:
     environment: API_TOKEN
+configs:
+  app_conf:
+    environment: APP_CONF_VALUE
 ```
 
 If the variable is unset or empty, the deploy fails before any Docker object is
 created.
+
+Configs are supported on Docker-Manager deploys, where the value travels in the
+stack `.env` and the manager resolves it. A raw daemon deploy supports secrets
+only. The two are handled differently on purpose: a secret's value is inlined
+locally so it is never written to the `.env` that is stored with the stack.
 
 ### `x-generate` — generated secrets
 

@@ -8,7 +8,7 @@ import shutil
 import sys
 import textwrap
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import os
 import yaml
 import json
@@ -703,6 +703,143 @@ def load_env_file(env_file: str, base_env: Optional[Dict[str, str]] = None, max_
     return _resolve_env_entries(entries, env_file, base_env=base_env, max_cycles=max_cycles)
 
 
+
+
+_ENV_REF_PATTERN = re.compile(r"\$\{([^}:\s]+)(?::-(.*?))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)")
+_ESCAPED_DOLLAR = "$_ESCAPED_DOLLAR_"
+
+
+def _escape_dollars(text: str) -> str:
+    """Marks text as a literal payload for the manager, which collapses `$$`."""
+    return text.replace("$", "$$")
+
+
+def _substitute_selected_vars(text: str, names: Set[str], replacements: Dict[str, str]) -> str:
+    """Expands only `names`, leaving every other `${VAR}` for the manager."""
+    if not names:
+        return text
+    guarded = text.replace("$$", _ESCAPED_DOLLAR)
+
+    def replace(match: "re.Match[str]") -> str:
+        var = match.group(1) if match.group(1) is not None else match.group(3)
+        if var not in names:
+            return match.group(0)
+        value = os.environ.get(var)
+        if value in (None, "") and match.group(2) is not None:
+            value = match.group(2)
+        if value in (None, ""):
+            return match.group(0)
+        for old, new in replacements.items():
+            value = value.replace(old, new)
+        return value
+
+    return _ENV_REF_PATTERN.sub(replace, guarded).replace(_ESCAPED_DOLLAR, "$$")
+
+
+def _substitute_selected_in_yaml_tree(value, names: Set[str], replacements: Dict[str, str]):
+    if isinstance(value, str):
+        return _substitute_selected_vars(value, names, replacements)
+    if isinstance(value, dict):
+        return {
+            _substitute_selected_in_yaml_tree(key, names, replacements): _substitute_selected_in_yaml_tree(item, names, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_substitute_selected_in_yaml_tree(item, names, replacements) for item in value]
+    return value
+
+
+def _mark_inline_secret_content_literal(compose_data) -> None:
+    """Protects inlined secret payloads from the manager's interpolation.
+
+    `x-content` is a payload, not a template: the file it came from was already
+    rendered locally when it was declared as `x-template-file`, and a `file:` or
+    `environment:` secret is verbatim by definition. Without this a `$` inside a
+    secret is read as a variable reference and the secret is silently corrupted
+    or the deploy fails on a variable the payload never meant to name.
+    """
+    if not isinstance(compose_data, dict):
+        return
+    secrets = compose_data.get("secrets")
+    if not isinstance(secrets, dict):
+        return
+    for details in secrets.values():
+        if isinstance(details, dict) and isinstance(details.get("x-content"), str):
+            details["x-content"] = _escape_dollars(details["x-content"])
+
+
+def _render_manager_compose(compose_data, secret_env_vars: Set[str], replacements: Dict[str, str]) -> str:
+    """Renders the compose a manager-backed deploy sends.
+
+    The manager owns interpolation: it receives the authored compose and the
+    `.env` holding the values, and it substitutes in the parsed document. So
+    variables are left standing here rather than rendered twice, which is what
+    the `$` doubling in `replacements` exists to undo. Only the variables the
+    manager cannot see are resolved locally - a secret sourced from the
+    environment is deliberately kept out of `.env` so its value is not stored
+    with the stack.
+
+    References are still checked here so a missing variable is reported against
+    the authored file, with its line and surrounding context, instead of coming
+    back as a deploy failure.
+    """
+    _mark_inline_secret_content_literal(compose_data)
+    missing: List[str] = []
+    _substitute_in_yaml_tree(compose_data, replacements, missing)
+    if missing:
+        _report_missing_variables(compose_data, replacements, missing)
+    return yaml.dump(_substitute_selected_in_yaml_tree(compose_data, secret_env_vars, replacements), sort_keys=False)
+
+
+def _substitute_in_yaml_tree(value, replacements: Dict[str, str], missing: List[str]):
+    """Expands `${VAR}` inside the scalars of a parsed compose document.
+
+    Substituting in the serialized text instead would let a variable's value
+    change the structure of the document. `KEY: ${JSON}` holding `{"a":"b"}`
+    reparses as a nested mapping, which the manager rejects as a non-scalar
+    environment value, and a value containing `: ` makes the document fail to
+    parse at all. Walking the tree keeps every substituted value a scalar,
+    whatever characters it contains.
+    """
+    if isinstance(value, str):
+        try:
+            return envsubst(value, replacements=replacements, on_error="throw")
+        except SubstitutionError as error:
+            missing.extend(result.variable_name for result in error.results if result.has_error)
+            return value
+    if isinstance(value, dict):
+        return {
+            _substitute_in_yaml_tree(key, replacements, missing): _substitute_in_yaml_tree(item, replacements, missing)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_substitute_in_yaml_tree(item, replacements, missing) for item in value]
+    return value
+
+
+def _render_compose_substitutions(compose_data, replacements: Dict[str, str]) -> str:
+    missing: List[str] = []
+    substituted = _substitute_in_yaml_tree(compose_data, replacements, missing)
+    if missing:
+        _report_missing_variables(compose_data, replacements, missing)
+    return yaml.dump(substituted, sort_keys=False)
+
+
+def _report_missing_variables(compose_data, replacements: Dict[str, str], missing: List[str]) -> None:
+    """Reports unresolved variables against the whole document.
+
+    Substitution happens scalar by scalar, which has no line numbers to report.
+    Re-running over the serialized document restores the line and context in the
+    error, and exits the same way it always has.
+    """
+    document = yaml.dump(compose_data, sort_keys=False)
+    envsubst(document, replacements=replacements)
+    raise SubstitutionError(
+        [LineCheckResult(line_no=1, line_content="", variable_name=name, start_index=0) for name in missing],
+        document,
+    )
+
+
 class Docker:
     def __init__(self, registries: List[str] = []):
         self.stack = DockerStack(self)
@@ -791,7 +928,27 @@ class DockerStack:
     def _relative_source_name(path: Path, base_dir: Path) -> str:
         return os.path.relpath(path, base_dir).replace(os.sep, "/")
 
-    def _build_env_xfile(self, sources: List[str], excluded_names: set) -> Optional[Dict[str, str]]:
+    @staticmethod
+    def _config_environment_vars(compose_data: dict) -> set:
+        """Variables named by `configs.<name>.environment`.
+
+        These are not `${VAR}` references, so scanning the compose text does not
+        find them, yet the manager resolves them from the stack `.env` like any
+        other variable. Secrets are deliberately absent: their value is inlined
+        locally so it is never stored alongside the stack.
+        """
+        config_env_vars = set()
+        configs = compose_data.get("configs", {})
+        if not isinstance(configs, dict):
+            return config_env_vars
+        for details in configs.values():
+            if isinstance(details, dict) and "environment" in details:
+                env_name = str(details["environment"]).strip()
+                if env_name:
+                    config_env_vars.add(env_name)
+        return config_env_vars
+
+    def _build_env_xfile(self, sources: List[str], excluded_names: set, extra_names: Optional[Set[str]] = None) -> Optional[Dict[str, str]]:
         seen = set()
         lines = []
         for source in sources:
@@ -805,6 +962,14 @@ class DockerStack:
                     continue
                 seen.add(name)
                 lines.append(f"{name}={value}")
+        for name in sorted(extra_names or ()):
+            if name in seen or name in excluded_names:
+                continue
+            value = os.environ.get(name)
+            if value in (None, ""):
+                continue
+            seen.add(name)
+            lines.append(f"{name}={value}")
         if not lines:
             return None
         content = ("\n".join(lines) + "\n").encode("utf-8")
@@ -912,12 +1077,19 @@ class DockerStack:
 
         # Define the replacements for '$' to '$$' for env variables in compose files
         replacements_map = {"$": "$$"}
-        clean_content = envsubst(yaml.dump(compose_data, sort_keys=False), replacements=replacements_map)
+        if manager_deploy:
+            clean_content = _render_manager_compose(compose_data, secret_env_vars, replacements_map)
+        else:
+            clean_content = _render_compose_substitutions(compose_data, replacements_map)
         enriched_data = yaml.safe_load(clean_content) or {}
         x_files = [
             {"path": "compose.yml", "content": self._b64_content(template_bytes)},
         ]
-        env_xfile = self._build_env_xfile(env_sources, secret_env_vars)
+        env_xfile = self._build_env_xfile(
+            env_sources,
+            secret_env_vars,
+            extra_names=self._config_environment_vars(compose_data) if manager_deploy else None,
+        )
         if env_xfile:
             x_files.append(env_xfile)
         x_files.extend(source_x_files)

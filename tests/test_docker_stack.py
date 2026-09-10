@@ -1754,3 +1754,168 @@ def test_manager_deploy_does_not_build_a_prompt_without_a_terminal(monkeypatch):
 
     assert "wait_for_poll" in seen
     assert seen["wait_for_poll"] is None  # pytest's stdin is not a terminal
+
+
+def _render_env_value(monkeypatch, tmp_path, compose_text):
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("docker_stack.docker_objects.DockerObjectManager.check", lambda *_args, **_kwargs: False)
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(compose_text)
+    rendered = Docker().stack.render_compose_file(str(compose_file), stack="app", include_build=False)
+    clean = yaml.safe_load(rendered.clean)
+    return clean["services"]["annotator-proxy"]["environment"]
+
+
+def test_folded_env_value_from_a_whole_variable_stays_a_string(monkeypatch, tmp_path):
+    monkeypatch.setenv("API_KEYS_JSON", '{"dev":"k1","prod":"k2"}')
+    compose_text = """services:
+  annotator-proxy:
+    image: proxy:1
+    environment:
+      ANNOTATOR_PROXY_API_KEYS_JSON: >-
+        ${API_KEYS_JSON}
+"""
+    env = _render_env_value(monkeypatch, tmp_path, compose_text)
+    value = env["ANNOTATOR_PROXY_API_KEYS_JSON"]
+    assert isinstance(value, str), f"expected a string, got {type(value).__name__}: {value!r}"
+    assert value == '{"dev":"k1","prod":"k2"}'
+
+
+def test_folded_env_value_with_variable_inside_json_stays_a_string(monkeypatch, tmp_path):
+    monkeypatch.setenv("BACKEND_KEY", "k1")
+    compose_text = """services:
+  annotator-proxy:
+    image: proxy:1
+    environment:
+      ANNOTATOR_PROXY_ANNOTATORS_JSON: >-
+        [{"name":"llm","api_key":"${BACKEND_KEY}"}]
+"""
+    env = _render_env_value(monkeypatch, tmp_path, compose_text)
+    value = env["ANNOTATOR_PROXY_ANNOTATORS_JSON"]
+    assert isinstance(value, str), f"expected a string, got {type(value).__name__}: {value!r}"
+    assert value == '[{"name":"llm","api_key":"k1"}]'
+
+
+def test_plain_env_value_from_a_variable_with_a_colon_stays_a_string(monkeypatch, tmp_path):
+    monkeypatch.setenv("REDIS_ADDR", "redis: 6379")
+    compose_text = """services:
+  annotator-proxy:
+    image: proxy:1
+    environment:
+      REDIS_ADDR: ${REDIS_ADDR}
+"""
+    env = _render_env_value(monkeypatch, tmp_path, compose_text)
+    value = env["REDIS_ADDR"]
+    assert isinstance(value, str), f"expected a string, got {type(value).__name__}: {value!r}"
+    assert value == "redis: 6379"
+
+
+def _render_for_manager(monkeypatch, tmp_path, compose_text):
+    fake_manager = FakeManagerClient()
+    monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda *_args, **_kwargs: fake_manager)
+    monkeypatch.setattr("docker_stack.docker_objects.run_cli_command", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr("docker_stack.docker_objects.DockerObjectManager.check", lambda *_args, **_kwargs: False)
+    compose_file = tmp_path / "docker-compose.yml"
+    compose_file.write_text(compose_text)
+    docker = Docker()
+    docker.stack._manager_client = fake_manager
+    return docker.stack.render_compose_file(str(compose_file), stack="app", include_build=False)
+
+
+def test_manager_deploy_leaves_variables_for_the_manager(monkeypatch, tmp_path):
+    monkeypatch.setenv("API_KEYS_JSON", '{"dev":"k1"}')
+    monkeypatch.setenv("REDIS_ADDR", "redis: 6379")
+    compose_text = """services:
+  annotator-proxy:
+    image: proxy:1
+    environment:
+      ANNOTATOR_PROXY_API_KEYS_JSON: ${API_KEYS_JSON}
+      REDIS_ADDR: ${REDIS_ADDR}
+"""
+    rendered = _render_for_manager(monkeypatch, tmp_path, compose_text)
+
+    # The document keeps its references; the manager resolves them in the tree.
+    env = yaml.safe_load(rendered.clean)["services"]["annotator-proxy"]["environment"]
+    assert env["ANNOTATOR_PROXY_API_KEYS_JSON"] == "${API_KEYS_JSON}"
+    assert env["REDIS_ADDR"] == "${REDIS_ADDR}"
+
+    # The values travel beside it, and the authored file is sent verbatim.
+    x_files = decode_x_files(rendered.enriched)
+    assert x_files[".env"] == 'API_KEYS_JSON={"dev":"k1"}\nREDIS_ADDR=redis: 6379\n'
+    assert x_files["compose.yml"] == compose_text
+
+
+def test_manager_deploy_resolves_secret_env_vars_locally(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_HOST", "app.internal")
+    monkeypatch.setenv("SECRET_ENV", "s3cr3t")
+    compose_text = """services:
+  api:
+    image: busybox
+    environment:
+      APP_HOST: ${APP_HOST}
+      TOKEN: ${SECRET_ENV}
+secrets:
+  env_secret:
+    environment: SECRET_ENV
+"""
+    rendered = _render_for_manager(monkeypatch, tmp_path, compose_text)
+    data = yaml.safe_load(rendered.clean)
+
+    # SECRET_ENV is kept out of .env so the value is not stored with the stack,
+    # so the manager cannot resolve it and it must be resolved here.
+    assert data["services"]["api"]["environment"]["TOKEN"] == "s3cr3t"
+    assert data["services"]["api"]["environment"]["APP_HOST"] == "${APP_HOST}"
+    assert data["secrets"]["env_secret"]["x-content"] == "s3cr3t"
+    assert decode_x_files(rendered.enriched)[".env"] == "APP_HOST=app.internal\n"
+
+
+def test_manager_deploy_keeps_dollar_in_secret_payload_literal(monkeypatch, tmp_path):
+    monkeypatch.setenv("PGPASS", "p$$w0rd")
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "token.txt").write_text("literal $HOME and ${NOT_A_VAR}\n")
+    compose_text = """services:
+  api:
+    image: busybox
+secrets:
+  file_secret:
+    file: ./secrets/token.txt
+  env_secret:
+    environment: PGPASS
+"""
+    rendered = _render_for_manager(monkeypatch, tmp_path, compose_text)
+    secrets = yaml.safe_load(rendered.clean)["secrets"]
+
+    # A payload is not a template. The manager collapses `$$` back to `$`, so
+    # doubling here is what makes it arrive verbatim.
+    assert secrets["file_secret"]["x-content"] == "literal $$HOME and $${NOT_A_VAR}\n"
+    assert secrets["env_secret"]["x-content"] == "p$$$$w0rd"
+
+
+def test_manager_deploy_ships_config_environment_values(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_CONF_VALUE", "host=app.internal")
+    monkeypatch.setenv("API_TOKEN", "t0ken")
+    compose_text = """services:
+  api:
+    image: busybox
+    configs:
+      - source: app_conf
+    secrets:
+      - source: api_token
+configs:
+  app_conf:
+    environment: APP_CONF_VALUE
+secrets:
+  api_token:
+    environment: API_TOKEN
+"""
+    rendered = _render_for_manager(monkeypatch, tmp_path, compose_text)
+    data = yaml.safe_load(rendered.clean)
+
+    # The config keeps its declaration and the manager resolves it from .env.
+    assert data["configs"]["app_conf"] == {"environment": "APP_CONF_VALUE"}
+    assert decode_x_files(rendered.enriched)[".env"] == "APP_CONF_VALUE=host=app.internal\n"
+
+    # The secret is inlined here instead, so its value never lands in .env.
+    assert data["secrets"]["api_token"]["x-content"] == "t0ken"
+    assert "API_TOKEN" not in decode_x_files(rendered.enriched)[".env"]
