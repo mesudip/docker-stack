@@ -36,8 +36,10 @@ jobs:
       # Build the distribution
       - name: Build distribution
         run: |
-          CURRENT_TAG=$(git describe --tags --abbrev=0)
-          VERSION=${CURRENT_TAG#v}  # Remove 'v' from the tag
+          # The pushed tag itself, never `git describe`: once the moving aliases
+          # below sit on a release commit, `describe` resolves to `v2` and the
+          # package publishes as version "2".
+          VERSION="${GITHUB_REF_NAME#v}"
           sed -i "s/version=\"[^\"]*\"/version=\"$VERSION\"/" setup.py
           python setup.py sdist bdist_wheel
 
@@ -45,3 +47,45 @@ jobs:
       - name: Upload to PyPI
         run: |
           twine upload dist/*
+
+  # Moving aliases: `v2` and `v2.3` follow the newest `v2.*.*` / `v2.3.*` release.
+  # Deliberately independent of `build`: consumers reach this repo as a GitHub
+  # Action (`uses: mesudip/docker-stack@v2`), which installs from git, not PyPI,
+  # so a PyPI outage must not leave the alias pointing at stale code.
+  move-aliases:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Aliases are chosen by comparing against every existing release tag.
+          fetch-depth: 0
+
+      - name: Move major and minor aliases to this release
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          MAJOR="${VERSION%%.*}"
+          MINOR="${VERSION#*.}"
+          MINOR="${MINOR%%.*}"
+
+          # An alias only ever moves forward. Cutting v2.1.3 as a backport while
+          # v2.3.1 exists must not drag `v2` back onto the older line.
+          promote() {
+            alias="$1"
+            pattern="$2"
+            latest="$(git tag -l "$pattern" | sort -V | tail -n1)"
+            if [ "$latest" != "$TAG" ]; then
+              echo "skip $alias: newest matching release is $latest, not $TAG"
+              return
+            fi
+            git tag -f "$alias" "$TAG"
+            git push --force origin "refs/tags/$alias"
+            echo "moved $alias -> $TAG"
+          }
+
+          promote "v$MAJOR" "v$MAJOR.*.*"
+          promote "v$MAJOR.$MINOR" "v$MAJOR.$MINOR.*"
