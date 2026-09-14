@@ -761,9 +761,7 @@ def test_abort_forbidden_is_a_typed_error(monkeypatch):
     client = ManagerApiClient("https://172.31.0.6:2378", skip_tls_verify=True)
 
     def urlopen(request, **_kwargs):
-        raise urllib.error.HTTPError(
-            request.full_url, 403, "Forbidden", {}, io.BytesIO(b'{"message":"stack deploy permission required"}')
-        )
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, io.BytesIO(b'{"message":"stack deploy permission required"}'))
 
     monkeypatch.setattr("docker_stack.manager_api.ensure_shell_access", lambda: None)
     monkeypatch.setattr("docker_stack.manager_api._docker_config_headers", dict)
@@ -807,7 +805,10 @@ def test_force_reports_when_a_different_run_was_aborted(monkeypatch):
     monkeypatch.setattr(
         client,
         "abort_active_deployment",
-        lambda **_kw: {"aborted": {"operation": "image deploy", "actor": "ci", "deployment_id": None, "started_at_ms": 5}, "released": True},
+        lambda **_kw: {
+            "aborted": {"operation": "image deploy", "actor": "ci", "deployment_id": None, "started_at_ms": 5},
+            "released": True,
+        },
     )
 
     client.deploy_stack_stream(
@@ -958,7 +959,9 @@ def test_rollback_stack_threads_wait_for_poll_and_force(monkeypatch):
 
     monkeypatch.setattr(client, "_request_json", fake_request)
 
-    payload = client.rollback_stack(stack="web", namespace="team-a", version="3", on_wait=notices.append, wait_for_poll=lambda a, s: "force")
+    payload = client.rollback_stack(
+        stack="web", namespace="team-a", version="3", on_wait=notices.append, wait_for_poll=lambda a, s: "force"
+    )
 
     assert payload["stdout"] == "rolled back"
     assert ("POST", "/api/stacks/deploy/abort", {"namespace": "team-a", "stack": "web"}, 45) in calls

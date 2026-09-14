@@ -48,7 +48,16 @@ from docker_stack.manager_api import (
     format_deploy_error_body,
 )
 from docker_stack.registry import DockerRegistry
-from .envsubst import LineCheckResult, SubstitutionError, envsubst, envsubst_load_file
+from .envsubst import (
+    ENV_DEFAULT_OPERATORS,
+    ENV_VAR_PATTERN,
+    LineCheckResult,
+    SubstitutionError,
+    envsubst,
+    envsubst_load_file,
+    ref_parts,
+    resolve_env_ref,
+)
 
 DOCKER_SHELL_ENDPOINT_ENV_VARS = (
     "DOCKER_HOST",
@@ -115,8 +124,7 @@ def _require_manager() -> ManagerApiClient:
     client = discover_manager_client(strict=True)
     if client is None or not client.is_manager_backend():
         raise RuntimeError(
-            f"{client.manager_url if client else 'the current Docker endpoint'} is not a "
-            "Docker-Manager; node-local commands need one"
+            f"{client.manager_url if client else 'the current Docker endpoint'} is not a " "Docker-Manager; node-local commands need one"
         )
     return client
 
@@ -130,10 +138,7 @@ def _select_node(value: str) -> str:
     nodes = client.list_nodes().get("nodes", [])
     exact = [node for node in nodes if str(node.get("id") or "") == requested]
     candidates = exact or [
-        node
-        for node in nodes
-        if str(node.get("id") or "").startswith(requested)
-        or str(node.get("hostname") or "") == requested
+        node for node in nodes if str(node.get("id") or "").startswith(requested) or str(node.get("hostname") or "") == requested
     ]
     if not candidates:
         raise RuntimeError(f"node '{requested}' is not visible or does not exist")
@@ -424,14 +429,8 @@ def _managed_docker(arguments: List[str]) -> int:
         or (value.startswith("-c") and value != "-c")
         for value in global_options
     )
-    is_ps = bool(command) and (
-        command[0] == "ps"
-        or (len(command) >= 2 and command[0] == "container" and command[1] in {"ls", "list"})
-    )
-    if explicit_target or not is_ps or any(
-        value in {"-q", "--quiet", "--format"} or value.startswith("--format=")
-        for value in command
-    ):
+    is_ps = bool(command) and (command[0] == "ps" or (len(command) >= 2 and command[0] == "container" and command[1] in {"ls", "list"}))
+    if explicit_target or not is_ps or any(value in {"-q", "--quiet", "--format"} or value.startswith("--format=") for value in command):
         return _exec_docker(values)
     try:
         client = discover_manager_client()
@@ -517,8 +516,7 @@ def _add_listing_namespace_arguments(parser: argparse.ArgumentParser) -> None:
 def _prompt_for_manager_target(context_name: str) -> str:
     if not sys.stdin.isatty():
         raise RuntimeError(
-            f"Unknown shell context '{context_name}'. Run "
-            f"'docker-stack shell --context {context_name} <manager-url>' to create it."
+            f"Unknown shell context '{context_name}'. Run " f"'docker-stack shell --context {context_name} <manager-url>' to create it."
         )
     print(f"Docker context '{context_name}' does not exist yet.")
     print("Enter the Docker-Manager URL to create it (for example https://manager.example.com:2376).")
@@ -571,7 +569,9 @@ class EnvFileResolutionError(Exception):
         return "\n".join(formatted_lines)
 
 
-ENV_VAR_PATTERN = re.compile(r"\$\{([^}:\s]+)(?::-(.*?))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)")
+# The compose interpolation grammar is defined once in envsubst.py and
+# imported above; see the note there for why a second copy is a deploy bug.
+_ref_name_operator_operand = ref_parts
 
 
 def _strip_matching_quotes(value: str) -> Tuple[str, int]:
@@ -614,8 +614,8 @@ def _parse_env_file(env_file: str) -> Tuple[List[EnvFileEntry], List[str]]:
 def _extract_refs(value: str) -> List[Tuple[str, int]]:
     refs = []
     for match in ENV_VAR_PATTERN.finditer(value):
-        var = match.group(1) if match.group(1) is not None else match.group(3)
-        start = match.start(1) if match.group(1) is not None else match.start(3)
+        var, _operator, _operand = _ref_name_operator_operand(match)
+        start = match.start(1) if match.group(1) is not None else match.start(4)
         refs.append((var, start))
     return refs
 
@@ -703,9 +703,9 @@ def load_env_file(env_file: str, base_env: Optional[Dict[str, str]] = None, max_
     return _resolve_env_entries(entries, env_file, base_env=base_env, max_cycles=max_cycles)
 
 
-
-
-_ENV_REF_PATTERN = re.compile(r"\$\{([^}:\s]+)(?::-(.*?))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)")
+# One pattern, not a second copy: a reference form recognised here but not by
+# the `.env` collector expands locally while its variable is never shipped.
+_ENV_REF_PATTERN = ENV_VAR_PATTERN
 _ESCAPED_DOLLAR = "$_ESCAPED_DOLLAR_"
 
 
@@ -721,13 +721,13 @@ def _substitute_selected_vars(text: str, names: Set[str], replacements: Dict[str
     guarded = text.replace("$$", _ESCAPED_DOLLAR)
 
     def replace(match: "re.Match[str]") -> str:
-        var = match.group(1) if match.group(1) is not None else match.group(3)
+        var, operator, operand = ref_parts(match)
         if var not in names:
             return match.group(0)
-        value = os.environ.get(var)
-        if value in (None, "") and match.group(2) is not None:
-            value = match.group(2)
-        if value in (None, ""):
+        value = resolve_env_ref(var, operator, operand, os.environ)
+        # Unresolvable: left standing so the manager reports it against the
+        # stack, rather than silently deploying an empty value.
+        if value is None:
             return match.group(0)
         for old, new in replacements.items():
             value = value.replace(old, new)
@@ -907,8 +907,8 @@ class DockerStack:
     @staticmethod
     def _iter_env_refs(value: str):
         for match in ENV_VAR_PATTERN.finditer(value):
-            name = match.group(1) if match.group(1) is not None else match.group(3)
-            default = match.group(2) if match.group(1) is not None else None
+            name, operator, operand = _ref_name_operator_operand(match)
+            default = operand if operator in ENV_DEFAULT_OPERATORS else None
             yield name, default
 
     @staticmethod
@@ -1573,9 +1573,7 @@ class DockerStack:
 
         manager_deploy = self._manager_client_for_feature(FEATURE_STACK_DEPLOY)
         if manager_deploy and tag:
-            raise RuntimeError(
-                "Docker-Manager stack deploy does not expose deployment tags; refusing to silently ignore --tag"
-            )
+            raise RuntimeError("Docker-Manager stack deploy does not expose deployment tags; refusing to silently ignore --tag")
         manager_options = {}
         if with_registry_auth:
             manager_options["with_registry_auth"] = True

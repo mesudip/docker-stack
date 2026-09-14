@@ -239,11 +239,15 @@ def test_missing_and_wrong_secrets_are_rejected_identically(tmp_path, monkeypatc
         base = {"version": PROTOCOL_VERSION, "operation": "status"}
         missing = raw_request(broker.socket_path, base)
         wrong = raw_request(broker.socket_path, {**base, "secret": "wrong"})
-        assert missing == wrong == {
-            "ok": False,
-            "reason": "unauthorized",
-            "message": "shell authentication rejected",
-        }
+        assert (
+            missing
+            == wrong
+            == {
+                "ok": False,
+                "reason": "unauthorized",
+                "message": "shell authentication rejected",
+            }
+        )
     finally:
         stop_broker(broker, thread, monkeypatch)
 
@@ -290,7 +294,7 @@ def test_prompt_hooks_only_read_local_status_and_docker_wrapper_preflights(tmp_p
     wrapper = (tmp_path / "bashrc").read_text(encoding="utf-8")
     prompt_function = wrapper.split("__docker_stack_prompt_update() {", 1)[1].split("}", 1)[0]
     assert "shell-auth" not in prompt_function
-    assert "docker-stack shell-auth ensure || return $?; docker-stack docker -- \"$@\"" in wrapper
+    assert 'docker-stack shell-auth ensure || return $?; docker-stack docker -- "$@"' in wrapper
     assert "(docker:office@${node})" in wrapper
     assert "(docker:!DOCKER_HOST)" in wrapper
 
@@ -395,7 +399,9 @@ def test_shell_supervisor_isolates_secret_and_removes_all_session_artifacts(tmp_
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("SHELL", "/bin/bash")
     monkeypatch.setenv("DOCKER_STACK_SHELL_SECRET", "outer-shell-secret")
-    monkeypatch.setattr("docker_stack.shell_auth.configure_docker_context_in_store", lambda _config, path: captured.setdefault("session", path))
+    monkeypatch.setattr(
+        "docker_stack.shell_auth.configure_docker_context_in_store", lambda _config, path: captured.setdefault("session", path)
+    )
 
     def fake_popen(command, **kwargs):
         captured["broker_command"] = command

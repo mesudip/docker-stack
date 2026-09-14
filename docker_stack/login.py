@@ -466,12 +466,7 @@ def resolve_login_config(
             inferred_context_name = manager_target
             if isolated_context_target:
                 resolved_docker_config_dir = isolated_config_dir
-    endpoint_context_name = (
-        context_name
-        or os.getenv("DOCKER_MANAGER_CONTEXT_NAME")
-        or inferred_context_name
-        or current_context_name
-    )
+    endpoint_context_name = context_name or os.getenv("DOCKER_MANAGER_CONTEXT_NAME") or inferred_context_name or current_context_name
     if manager_target:
         resolved_manager_url, skip_tls_verify = _resolve_manager_endpoint(
             raw_manager_value,
@@ -1038,9 +1033,7 @@ def browser_login(
         refresh_token = str(refresh_token) if isinstance(refresh_token, str) and refresh_token.strip() else None
         refresh_expires_in = token_response.get("refresh_expires_in")
         refresh_expires_at = (
-            int(time.time()) + int(refresh_expires_in)
-            if isinstance(refresh_expires_in, int) and refresh_expires_in > 0
-            else None
+            int(time.time()) + int(refresh_expires_in) if isinstance(refresh_expires_in, int) and refresh_expires_in > 0 else None
         )
         return DockerManagerLoginResult(
             access_token=access_token,

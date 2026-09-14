@@ -45,8 +45,7 @@ def test_node_use_updates_only_managed_shell_config(monkeypatch, tmp_path):
                 {"id": "node-worker-123", "hostname": "worker-02", "state": "Ready"},
             ]
         },
-        check_node_agent=lambda selector: checked.append(selector)
-        or {"node_id": selector, "node_name": "worker-02", "agent": "ready"},
+        check_node_agent=lambda selector: checked.append(selector) or {"node_id": selector, "node_name": "worker-02", "agent": "ready"},
     )
     monkeypatch.setattr("docker_stack.cli._require_manager", lambda: client)
 
@@ -84,7 +83,7 @@ def test_managed_docker_ps_renders_node_column(monkeypatch, capsys):
                 }
             ],
             "node_errors": [],
-        }
+        },
     )
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
 
@@ -128,7 +127,15 @@ def test_managed_docker_ps_matches_docker_columns(monkeypatch, capsys):
     header, row = capsys.readouterr().out.splitlines()
 
     assert header.split() == [
-        "CONTAINER", "ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES", "NODE",
+        "CONTAINER",
+        "ID",
+        "IMAGE",
+        "COMMAND",
+        "CREATED",
+        "STATUS",
+        "PORTS",
+        "NAMES",
+        "NODE",
     ]
     assert row.startswith("467fce208a05   ")
     assert '"sh -c \'java $JAVA_O\u2026"' in row
@@ -193,8 +200,7 @@ def test_managed_docker_ps_forwards_global_latest_and_limit(monkeypatch):
     calls = []
     client = SimpleNamespace(
         is_manager_backend=lambda: True,
-        list_containers=lambda **kwargs: calls.append(kwargs)
-        or {"containers": [], "node_errors": []},
+        list_containers=lambda **kwargs: calls.append(kwargs) or {"containers": [], "node_errors": []},
     )
     monkeypatch.setattr("docker_stack.cli.discover_manager_client", lambda: client)
 
@@ -686,7 +692,8 @@ def test_rendered_compose_normalizes_main_source_name(monkeypatch, tmp_path):
 
 def test_build_uses_service_dockerfile(tmp_path):
     compose_file = tmp_path / "docker-compose.yml"
-    compose_file.write_text("""
+    compose_file.write_text(
+        """
 services:
   storybook:
     image: example/storybook:test
@@ -695,7 +702,8 @@ services:
       dockerfile: storybook.Dockerfile
       args:
         NPMRC_TOKEN: dummy
-""".strip())
+""".strip()
+    )
 
     docker = Docker()
     docker.stack.build_and_push(str(compose_file))
@@ -1015,9 +1023,7 @@ def test_manager_deploy_prints_generated_secret_values(capsys):
                 "warnings": [],
                 "stdout": "",
                 "stderr": "",
-                "generated_secrets": [
-                    {"logical_name": "app-token", "actual_name": "team-a_app-token", "value": "generated-value"}
-                ],
+                "generated_secrets": [{"logical_name": "app-token", "actual_name": "team-a_app-token", "value": "generated-value"}],
             }
 
     Docker().stack._deploy_via_manager(
@@ -1500,7 +1506,9 @@ def test_shell_explicit_target_persists_context_before_opening(monkeypatch):
     events = []
     monkeypatch.setattr("docker_stack.cli.resolve_shell_login_config", lambda **_kwargs: config)
     monkeypatch.setattr("docker_stack.cli.persist_shell_context", lambda value: events.append(("persist", value.context_name)))
-    monkeypatch.setattr("docker_stack.cli.browser_login", lambda _config: events.append(("login", "saas-a")) or SimpleNamespace(expires_at=None))
+    monkeypatch.setattr(
+        "docker_stack.cli.browser_login", lambda _config: events.append(("login", "saas-a")) or SimpleNamespace(expires_at=None)
+    )
     monkeypatch.setattr("docker_stack.cli.run_managed_shell", lambda _config, _result: 0)
 
     with pytest.raises(SystemExit) as excinfo:
@@ -1919,3 +1927,70 @@ secrets:
     # The secret is inlined here instead, so its value never lands in .env.
     assert data["secrets"]["api_token"]["x-content"] == "t0ken"
     assert "API_TOKEN" not in decode_x_files(rendered.enriched)[".env"]
+
+
+# Compose interpolation forms the manager's `substitute_template` understands.
+# The CLI leaves these standing for the manager to resolve, so every variable
+# one of them names has to reach the manager in the stack `.env`. Forms the CLI
+# fails to recognise are collected by nothing and the deploy dies with
+# `missing template variable` against a variable that was set the whole time.
+MANAGER_INTERPOLATION_FORMS = [
+    "${DEPLOY_VAR}",
+    "${DEPLOY_VAR:-fallback}",
+    "${DEPLOY_VAR-fallback}",
+    "${DEPLOY_VAR:?must be set}",
+    "${DEPLOY_VAR?}",
+    "${DEPLOY_VAR:+present}",
+    "${DEPLOY_VAR+present}",
+    "$DEPLOY_VAR",
+]
+
+
+def _manager_resolvable(rendered, name):
+    """Whether the manager could resolve `name` from what the CLI shipped.
+
+    Either the reference was expanded before sending, or the value travels in
+    the stack `.env` the manager interpolates from.
+    """
+    if name not in rendered.clean:
+        return True
+    return f"{name}=" in decode_x_files(rendered.enriched).get(".env", "")
+
+
+@pytest.mark.parametrize("form", MANAGER_INTERPOLATION_FORMS)
+def test_every_manager_interpolation_form_ships_its_variable(monkeypatch, tmp_path, form):
+    monkeypatch.setenv("DEPLOY_VAR", '{"dev":"k1"}')
+    compose_text = (
+        "services:\n"
+        "  annotator-api:\n"
+        "    image: nginx:alpine\n"
+        "    environment:\n"
+        f'      ANNOTATOR_API_KEYS_JSON: "{form}"\n'
+    )
+
+    rendered = _render_for_manager(monkeypatch, tmp_path, compose_text)
+
+    assert _manager_resolvable(rendered, "DEPLOY_VAR"), (
+        f"{form} reaches the manager unresolved and DEPLOY_VAR is absent from .env"
+    )
+
+
+def test_conditional_operand_is_not_mistaken_for_a_default(monkeypatch, tmp_path):
+    """`:+` supplies a value only when the variable IS set; it is not a default.
+
+    Collecting the operand as one would write `FEATURE_FLAGS=present` into the
+    `.env` for an unset variable, so the manager would expand the alternate
+    value as though it were the variable's own.
+    """
+    monkeypatch.delenv("FEATURE_FLAGS", raising=False)
+    compose_text = (
+        "services:\n"
+        "  annotator-api:\n"
+        "    image: nginx:alpine\n"
+        "    environment:\n"
+        '      FLAGS: "${FEATURE_FLAGS:+present}"\n'
+    )
+
+    rendered = _render_for_manager(monkeypatch, tmp_path, compose_text)
+
+    assert "FEATURE_FLAGS=present" not in decode_x_files(rendered.enriched).get(".env", "")

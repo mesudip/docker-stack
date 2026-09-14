@@ -8,7 +8,9 @@ DESCRIPTION
 
     supported syntax:
       normal       - ${VARIABLE1} or $VARIABLE1
-      with default - ${VARIABLE1:-somevalue}
+      with default - ${VARIABLE1:-somevalue} or ${VARIABLE1-somevalue}
+      required     - ${VARIABLE1:?message} or ${VARIABLE1?message}
+      alternate    - ${VARIABLE1:+somevalue} or ${VARIABLE1+somevalue}
 """
 
 from dataclasses import dataclass
@@ -16,6 +18,62 @@ import os
 import re
 import sys
 from typing import Dict, List, Literal, Optional
+
+
+# The compose interpolation grammar, defined once.
+#
+# Docker-Manager resolves these same forms server-side, and the CLI leaves
+# references standing for it to resolve, so three places have to agree on what
+# a reference is: this substituter, the stack `.env` collector, and local
+# expansion of secret-sourced variables. A form one of them fails to recognise
+# is collected by nobody and the deploy dies with `missing template variable`
+# naming a variable that was set the whole time.
+#
+# The name is restricted to `[A-Za-z0-9_]` on purpose. A looser class swallows
+# the operator: `${VAR-default}` under `[^}:\s]+` parses as a variable
+# literally named `VAR-default`, which is never set.
+#
+# Groups: 1 name, 2 operator, 3 operand, 4 bare `$NAME`. Colon forms lead the
+# alternation so `:-` is never read as a bare `-`.
+ENV_REF_RE = r"\$\{([A-Za-z0-9_]+)(?:(:-|:\?|:\+|-|\?|\+)(.*?))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)"
+
+ENV_VAR_PATTERN = re.compile(ENV_REF_RE)
+
+# Operators whose operand stands in for the variable's own value. `:?`/`?` take
+# an error message and `:+`/`+` an alternate used only when the variable IS set,
+# so treating either as a default ships a value the author never wrote.
+ENV_DEFAULT_OPERATORS = frozenset({":-", "-"})
+
+
+def ref_parts(match: "re.Match[str]"):
+    """Splits an ENV_VAR_PATTERN match into (name, operator, operand)."""
+    if match.group(1) is not None:
+        return match.group(1), match.group(2), match.group(3)
+    return match.group(4), None, None
+
+
+def resolve_env_ref(name: str, operator: Optional[str], operand: Optional[str], env) -> Optional[str]:
+    """Resolves one reference, mirroring the manager's `substitute_template`.
+
+    Returns None when the reference cannot be resolved, which the caller
+    reports rather than substituting an empty value.
+    """
+    existing = env.get(name, None)
+    is_set = existing is not None
+    is_nonempty = bool(existing)
+    if operator == ":-":
+        return existing if is_nonempty else operand
+    if operator == "-":
+        return existing if is_set else operand
+    if operator == ":+":
+        return operand if is_nonempty else ""
+    if operator == "+":
+        return operand if is_set else ""
+    if operator == ":?":
+        return existing if is_nonempty else None
+    if operator == "?":
+        return existing if is_set else None
+    return existing if is_nonempty else None
 
 
 @dataclass
@@ -102,8 +160,10 @@ class SubstitutionError(Exception):
 def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, on_error: Literal["exit", "throw"] = "exit"):
     """Substitute environment variables in the template string, supporting default values."""
 
-    # Combined regex for ${VAR:-default} and $VAR, and also $$
-    pattern = re.compile(r"\$\_ESCAPED_DOLLAR_|\$\{([^}:\s]+)(?::-(.*?))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)")
+    # The shared grammar, with the escaped-dollar placeholder in front. That
+    # alternative captures nothing, so the group numbers stay as ENV_REF_RE
+    # defines them.
+    pattern = re.compile(r"\$\_ESCAPED_DOLLAR_|" + ENV_REF_RE)
 
     # Handle escaped dollars
     template_str = template_str.replace("$$", "$_ESCAPED_DOLLAR_")
@@ -120,24 +180,12 @@ def envsubst(template_str, env=os.environ, replacements: Dict[str, str] = None, 
         def replacer(match: re.Match[str]):
             if match.group(0) == "$_ESCAPED_DOLLAR_":
                 return "$$"
-            # Group 1, 2 for ${VAR:-default}
-            if match.group(1) is not None:
-                var = match.group(1)
-                has_default = match.group(2) is not None
-                default_value = match.group(2) if has_default else None
-                result = env.get(var, None)
-                if result in (None, "") and has_default:
-                    result = default_value
-                if result in (None, "") and not has_default:
-                    line_errors_raw.append((var, match.start(1)))  # Use match.start(1) for ${VAR}
-                    return match.group(0)  # Keep original if variable not found
-            # Group 3 for $VAR
-            else:
-                var = match.group(3)
-                result = env.get(var, None)
-                if result in (None, ""):
-                    line_errors_raw.append((var, match.start(3)))  # Use match.start(3) for $VAR
-                    return match.group(0)  # Keep original if variable not found
+            var, operator, operand = ref_parts(match)
+            start = match.start(1) if match.group(1) is not None else match.start(4)
+            result = resolve_env_ref(var, operator, operand, env)
+            if result is None:
+                line_errors_raw.append((var, start))
+                return match.group(0)  # Keep original if variable not found
 
             if replacements:
                 for old, new in replacements.items():

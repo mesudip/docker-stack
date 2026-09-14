@@ -502,7 +502,9 @@ def test_resolve_login_config_ignores_malformed_context_host(monkeypatch):
 
 
 def test_resolve_login_config_detects_tls_for_positional_target(monkeypatch):
-    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True))
+    monkeypatch.setattr(
+        "docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True)
+    )
 
     config = resolve_login_config(manager_target="172.31.0.6:2378", context_name="office")
 
@@ -516,7 +518,9 @@ def test_resolve_login_config_prefers_named_context_for_portless_target(monkeypa
         "docker_stack.login.docker_context_target",
         lambda context_name, docker_config_dir=None: "tcp://172.31.0.6:2378" if context_name == "office" else None,
     )
-    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True))
+    monkeypatch.setattr(
+        "docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True)
+    )
 
     config = resolve_login_config(manager_target="office")
 
@@ -550,7 +554,9 @@ def test_resolve_login_config_uses_current_context_target(monkeypatch):
         "docker_stack.login.current_docker_context_target",
         lambda: ("office", "tcp://172.31.0.6:2378"),
     )
-    monkeypatch.setattr("docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True))
+    monkeypatch.setattr(
+        "docker_stack.login.detect_manager_url", lambda value, verify_ssl=False, **_kwargs: ("https://172.31.0.6:2378", True)
+    )
 
     config = resolve_login_config()
 

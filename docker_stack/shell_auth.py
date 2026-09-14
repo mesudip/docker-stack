@@ -542,13 +542,11 @@ def _write_shell_wrappers(
     zsh_dir = session_dir / "zsh"
     zsh_dir.mkdir(mode=0o700)
     original_bashrc = Path.home() / ".bashrc"
-    original_zshrc_root = Path(
-        os.getenv(SHELL_ORIGINAL_ZDOTDIR_ENV) or os.getenv("ZDOTDIR", str(Path.home()))
-    )
+    original_zshrc_root = Path(os.getenv(SHELL_ORIGINAL_ZDOTDIR_ENV) or os.getenv("ZDOTDIR", str(Path.home())))
     original_zshrc = original_zshrc_root / ".zshrc"
     original_zsh_history = original_zshrc_root / ".zsh_history"
     bash_rc.write_text(
-        f'''[ -f {json.dumps(str(original_bashrc))} ] && source {json.dumps(str(original_bashrc))}
+        f"""[ -f {json.dumps(str(original_bashrc))} ] && source {json.dumps(str(original_bashrc))}
 __docker_stack_base_ps1="$PS1"
 __docker_stack_prompt_update() {{
   local state expires now color reset node
@@ -570,13 +568,13 @@ __docker_stack_prompt_update() {{
 }}
 case ";${{PROMPT_COMMAND:-}};" in *';__docker_stack_prompt_update;'*) ;; *) PROMPT_COMMAND="__docker_stack_prompt_update${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}";; esac
 docker() {{ docker-stack shell-auth ensure || return $?; docker-stack docker -- "$@"; }}
-''',
+""",
         encoding="utf-8",
     )
     os.chmod(bash_rc, 0o600)
     zsh_rc = zsh_dir / ".zshrc"
     zsh_rc.write_text(
-        f'''typeset -g __docker_stack_session_zdotdir="$ZDOTDIR"
+        f"""typeset -g __docker_stack_session_zdotdir="$ZDOTDIR"
 typeset -g ZDOTDIR={json.dumps(str(original_zshrc_root))}
 typeset -g HISTFILE={json.dumps(str(original_zsh_history))}
 typeset -g SHELL_SESSION_HISTORY=0
@@ -606,7 +604,7 @@ __docker_stack_prompt_update() {{
 }}
 add-zsh-hook precmd __docker_stack_prompt_update
 docker() {{ docker-stack shell-auth ensure || return $?; docker-stack docker -- "$@"; }}
-''',
+""",
         encoding="utf-8",
     )
     os.chmod(zsh_rc, 0o600)
@@ -738,9 +736,7 @@ def run_managed_shell(config: DockerManagerLoginConfig, result: DockerManagerLog
         # need to re-probe it (a verified probe against a private CA only
         # produces aborted TLS connections on the manager).
         env[DOCKER_MANAGER_SKIP_TLS_VERIFY_ENV] = "1" if config.skip_tls_verify else "0"
-        env[SHELL_ORIGINAL_ZDOTDIR_ENV] = str(
-            Path(os.getenv(SHELL_ORIGINAL_ZDOTDIR_ENV) or os.getenv("ZDOTDIR", str(Path.home())))
-        )
+        env[SHELL_ORIGINAL_ZDOTDIR_ENV] = str(Path(os.getenv(SHELL_ORIGINAL_ZDOTDIR_ENV) or os.getenv("ZDOTDIR", str(Path.home()))))
         command = [shell, "--rcfile", str(session_dir / "bashrc"), "-i"] if shell_name == "bash" else [shell, "-i"]
         return subprocess.run(command, check=False, env=env).returncode
     finally:

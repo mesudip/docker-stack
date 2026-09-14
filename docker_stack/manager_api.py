@@ -189,11 +189,7 @@ def _public_deploy_options(options: Optional[Dict[str, Any]], compose: str) -> O
 def _public_image_deploy_options(options: Optional[Dict[str, Any]], images: Dict[str, str]) -> Optional[Dict[str, Any]]:
     prepared = dict(options or {})
     if prepared.get("with_registry_auth"):
-        registries = {
-            _image_registry(image.strip())
-            for image in images.values()
-            if isinstance(image, str) and image.strip()
-        }
+        registries = {_image_registry(image.strip()) for image in images.values() if isinstance(image, str) and image.strip()}
         registry_auth = _docker_config_registry_auths(registries)
         if registry_auth:
             prepared["registry_auth"] = registry_auth
@@ -711,9 +707,7 @@ class ManagerApiClient:
                     raise
                 now = time.monotonic()
                 if on_wait and (last_notice is None or now - last_notice >= DEPLOY_WAIT_NOTICE_SECS):
-                    on_wait(
-                        {**exc.active_deployment, "phase": "waiting", "waited_secs": waited, "wait_budget_secs": budget}
-                    )
+                    on_wait({**exc.active_deployment, "phase": "waiting", "waited_secs": waited, "wait_budget_secs": budget})
                     last_notice = now
                 if wait_for_poll is None:
                     time.sleep(DEPLOY_WAIT_POLL_SECS)
@@ -759,9 +753,7 @@ class ManagerApiClient:
         return True
 
     def list_stacks(self, *, namespace: Optional[str] = DEFAULT_NAMESPACE) -> Dict[str, Any]:
-        query = urllib.parse.urlencode(
-            {"namespace": namespace} if namespace is not None else {"all_namespaces": "true"}
-        )
+        query = urllib.parse.urlencode({"namespace": namespace} if namespace is not None else {"all_namespaces": "true"})
         if self._detect_manager_backend():
             return self._request_json(f"/api/docker-stack/stacks?{query}")
         return self._request_json(f"{self._endpoint_path('/inventory/stacks')}?{query}")
@@ -858,9 +850,7 @@ class ManagerApiClient:
             params["limit"] = str(limit)
         if latest:
             params["latest"] = "1"
-        payload = self._request_json(
-            f"/api/docker-stack/containers?{urllib.parse.urlencode(params)}"
-        )
+        payload = self._request_json(f"/api/docker-stack/containers?{urllib.parse.urlencode(params)}")
         if not isinstance(payload, dict) or not isinstance(payload.get("containers"), list):
             raise RuntimeError("Docker-Manager containers response is invalid")
         return payload
@@ -1080,9 +1070,7 @@ class ManagerApiClient:
         )
 
 
-def discover_manager_client(
-    timeout_secs: int = 5, *, strict: bool = False
-) -> Optional[ManagerApiClient]:
+def discover_manager_client(timeout_secs: int = 5, *, strict: bool = False) -> Optional[ManagerApiClient]:
     """Build a client for the manager behind DOCKER_MANAGER_URL or the Docker context.
 
     ``strict`` raises the concrete reason instead of returning ``None``. Callers that
@@ -1105,9 +1093,7 @@ def discover_manager_client(
             config = resolve_login_config(manager_target=context_target)
         else:
             if strict:
-                raise RuntimeError(
-                    "no Docker-Manager endpoint found: DOCKER_MANAGER_URL is unset and the docker CLI is not installed"
-                )
+                raise RuntimeError("no Docker-Manager endpoint found: DOCKER_MANAGER_URL is unset and the docker CLI is not installed")
             return None
     except RuntimeError:
         if strict:
